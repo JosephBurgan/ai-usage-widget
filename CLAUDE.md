@@ -1,4 +1,7 @@
-# claude-usage-widget — project standards
+# ai-usage-widget — project standards
+
+GitHub: https://github.com/JosephBurgan/ai-usage-widget
+The checkout on this PC is still `C:\Users\Joseph\claude-usage-widget`.
 
 Standing rules for any agent working in this repo. Read before editing or pushing.
 

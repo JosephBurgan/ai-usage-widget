@@ -24,8 +24,8 @@ A small always-on-top floating window for Windows that shows your Claude.ai plan
 ## Install
 
 ```powershell
-git clone https://github.com/JosephBurgan/claude-usage-widget.git
-cd claude-usage-widget
+git clone https://github.com/JosephBurgan/ai-usage-widget.git
+cd ai-usage-widget
 powershell -ExecutionPolicy Bypass -File setup.ps1
 ```
 
@@ -43,7 +43,7 @@ That runs `git pull` and relaunches the widget automatically.
 Or manually:
 
 ```powershell
-cd C:\path\to\claude-usage-widget
+cd C:\path\to\ai-usage-widget
 git pull
 ```
 
