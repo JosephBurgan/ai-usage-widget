@@ -1,7 +1,7 @@
-# Claude Usage Widget
+# AI Usage Widget
 
 
-A small always-on-top floating window for Windows that shows your Claude.ai plan usage (5-hour, 7-day, Sonnet-only, extra credits) with live progress bars and reset countdowns. Refreshes every 30 seconds.
+A small always-on-top floating window for Windows that shows your Claude.ai plan usage (5-hour, 7-day, Sonnet-only, extra credits) and, when the Grok CLI is already signed in on this PC, your Grok usage too. Switch with the Claude / Grok tabs. An account that is not signed in does not get a tab and does not get a login prompt. Weekly bars have a notch at each day boundary. Refreshes on a timer (configurable).
 
 ![widget](docs/screenshot.png)
 

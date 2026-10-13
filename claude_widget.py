@@ -1,12 +1,13 @@
-"""Claude Usage Widget — floating always-on-top window showing Claude.ai plan usage.
+"""Usage widget — floating always-on-top window for Claude and Grok plan usage.
 
-Reads OAuth tokens from ~/.claude/.credentials.json (created by the Claude Code
-CLI), polls https://api.anthropic.com/api/oauth/usage every 30 seconds, and
-auto-refreshes the access token when it's near expiry.
+Claude reads ~/.claude/.credentials.json. Grok reads ~/.grok/auth.json.
+A source with no saved sign-in is left off the window. No prompt, no error.
 """
 
 from __future__ import annotations
 
+import base64
+import ctypes
 import json
 import os
 import subprocess
@@ -15,6 +16,9 @@ import tempfile
 import threading
 import time
 import tkinter as tk
+import tkinter.font as tkfont
+from ctypes import wintypes
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -24,6 +28,7 @@ from requests.exceptions import HTTPError
 
 HOME          = Path.home()
 CREDS_FILE    = HOME / ".claude" / ".credentials.json"
+GROK_AUTH     = HOME / ".grok" / "auth.json"
 SETTINGS_FILE = HOME / ".claude_widget_settings.json"
 REPO_DIR      = Path(__file__).resolve().parent
 
@@ -138,6 +143,241 @@ def is_auth_error(exc: BaseException) -> bool:
     return False
 
 
+def claude_connected() -> bool:
+    """True when Claude Code has a saved sign-in. Missing file is not an error."""
+    try:
+        oauth = _read_json(CREDS_FILE).get("claudeAiOauth") or {}
+    except (OSError, json.JSONDecodeError, KeyError):
+        return False
+    return bool(oauth.get("accessToken") and oauth.get("refreshToken"))
+
+
+# ── Grok (optional second source) ────────────────────────────────────────────
+
+GROK_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
+GROK_BILLING   = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
+GROK_SETTINGS  = "https://cli-chat-proxy.grok.com/v1/settings"
+GROK_AUTH_HDR  = {"x-xai-token-auth": "xai-grok-cli", "Accept": "application/json"}
+BOT_USAGE_URL  = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus"
+BOT_LABEL      = "Bot"
+GROK_TOKEN_REFRESH_MARGIN_S = 5 * 60
+
+GROK_PRODUCT_LABELS = {
+    "GrokChat":    "Chat",
+    "GrokBuild":   "Build",
+    "GrokImagine": "Imagine",
+    "GrokVoice":   "Voice",
+    "GrokAPI":     "API",
+}
+
+
+def grok_connected() -> bool:
+    """True when the Grok CLI has a saved sign-in. Missing file is not an error."""
+    try:
+        _pick_grok_auth(_read_json(GROK_AUTH))
+    except (OSError, json.JSONDecodeError, KeyError):
+        return False
+    return True
+
+
+def _parse_expires_at(raw: object) -> float | None:
+    if not raw:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw) / 1000.0 if raw > 1e12 else float(raw)
+    try:
+        return datetime.fromisoformat(str(raw).replace("Z", "+00:00")).timestamp()
+    except ValueError:
+        return None
+
+
+def _pick_grok_auth(root: dict) -> tuple[str, dict]:
+    best: tuple[str, dict] | None = None
+    best_exp = -1.0
+    for key, entry in root.items():
+        if not isinstance(entry, dict):
+            continue
+        if not entry.get("key") or not entry.get("refresh_token"):
+            continue
+        exp = _parse_expires_at(entry.get("expires_at")) or 0.0
+        score = exp + (1e12 if "auth.x.ai" in key else 0.0)
+        if score > best_exp:
+            best_exp = score
+            best = (key, entry)
+    if best is None:
+        raise FileNotFoundError(GROK_AUTH)
+    return best
+
+
+def _grok_token_url(entry: dict) -> str:
+    issuer = (entry.get("oidc_issuer") or "https://auth.x.ai").rstrip("/")
+    return f"{issuer}/oauth2/token"
+
+
+def _grok_client_id(entry: dict, map_key: str) -> str:
+    if entry.get("oidc_client_id"):
+        return str(entry["oidc_client_id"])
+    if "::" in map_key:
+        return map_key.rsplit("::", 1)[-1]
+    return GROK_CLIENT_ID
+
+
+def _save_grok_auth(map_key: str, patch: dict) -> None:
+    root = _read_json(GROK_AUTH)
+    if map_key not in root or not isinstance(root[map_key], dict):
+        raise FileNotFoundError(GROK_AUTH)
+    root[map_key].update(patch)
+    _write_json_atomic(GROK_AUTH, root)
+
+
+def grok_access_token() -> str:
+    root = _read_json(GROK_AUTH)
+    map_key, entry = _pick_grok_auth(root)
+    exp = _parse_expires_at(entry.get("expires_at"))
+    if exp is not None and exp - time.time() > GROK_TOKEN_REFRESH_MARGIN_S:
+        return str(entry["key"])
+
+    r = requests.post(
+        _grok_token_url(entry),
+        data={
+            "grant_type":    "refresh_token",
+            "client_id":     _grok_client_id(entry, map_key),
+            "refresh_token": entry["refresh_token"],
+        },
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        timeout=15,
+    )
+    r.raise_for_status()
+    data = r.json()
+    expires_in = int(data.get("expires_in") or 21600)
+    expires_at = datetime.fromtimestamp(
+        time.time() + expires_in, tz=timezone.utc
+    ).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    _save_grok_auth(map_key, {
+        "key":           data["access_token"],
+        "refresh_token": data.get("refresh_token", entry["refresh_token"]),
+        "expires_at":    expires_at,
+    })
+    return data["access_token"]
+
+
+def _roaming_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata)
+    return HOME / "AppData" / "Roaming"
+
+
+class _DataBlob(ctypes.Structure):
+    _fields_ = [
+        ("cbData", wintypes.DWORD),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+
+def _dpapi_decrypt(data: bytes) -> bytes:
+    buf = ctypes.create_string_buffer(data)
+    blob_in = _DataBlob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+    blob_out = _DataBlob()
+    if not ctypes.windll.crypt32.CryptUnprotectData(
+        ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+    ):
+        raise ctypes.WinError()
+    try:
+        return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+    finally:
+        ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+
+
+def _bot_aes_key() -> bytes:
+    local_state = _roaming_dir() / "Grok Bot" / "Local State"
+    raw = json.loads(local_state.read_text(encoding="utf-8"))
+    enc_key = base64.b64decode(raw["os_crypt"]["encrypted_key"])
+    if not enc_key.startswith(b"DPAPI"):
+        raise ValueError("Unexpected Grok Bot encryption key")
+    return _dpapi_decrypt(enc_key[5:])
+
+
+def _decrypt_v10(value: str, key: bytes) -> str:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    raw = base64.b64decode(value)
+    if not raw.startswith(b"v10") or len(raw) < 3 + 12 + 16:
+        raise ValueError("Unexpected Grok Bot secret format")
+    nonce, ct = raw[3:15], raw[15:]
+    return AESGCM(key).decrypt(nonce, ct, None).decode("utf-8")
+
+
+def _open_secret(value: str, key: bytes) -> str:
+    if value.startswith("eyJ") and value.count(".") == 2:
+        return value
+    return _decrypt_v10(value, key)
+
+
+def fetch_grok_bot_usage() -> dict | None:
+    """Best-effort Bot row. No Grok Bot sign-in just omits the row."""
+    secrets = _roaming_dir() / "Grok Bot" / "sand-secrets.json"
+    if not secrets.is_file():
+        return None
+    try:
+        root = _read_json(secrets)
+        accounts_raw = root.get("cursor-accounts")
+        accounts = json.loads(accounts_raw) if isinstance(accounts_raw, str) else accounts_raw
+        if not isinstance(accounts, dict):
+            return None
+        active = accounts.get("active")
+        account = (accounts.get("accounts") or {}).get(active)
+        if not isinstance(account, dict):
+            return None
+        token = _open_secret(str(account.get("cursor-access-token") or ""), _bot_aes_key())
+        r = requests.post(
+            BOT_USAGE_URL,
+            data=b"{}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Content-Type": "application/json",
+                "Connect-Protocol-Version": "1",
+                "x-cursor-client-type": "sand",
+                "x-cursor-client-version": "sand-desktop",
+                "x-ghost-mode": "true",
+            },
+            timeout=15,
+        )
+        r.raise_for_status()
+        body = r.json()
+        pct = float(body["usagePercent"])
+    except Exception:
+        return None
+    return {
+        "usagePercent": pct,
+        "periodStart": body.get("currentPeriodStart") or "",
+        "nextReset": body.get("nextResetTimestampUtc") or "",
+    }
+
+
+def fetch_grok_usage() -> dict:
+    token = grok_access_token()
+    headers = {"Authorization": f"Bearer {token}", **GROK_AUTH_HDR}
+    r = requests.get(GROK_BILLING, headers=headers, timeout=15)
+    r.raise_for_status()
+    payload = r.json()
+    try:
+        s = requests.get(GROK_SETTINGS, headers=headers, timeout=5)
+        if s.ok:
+            tier = (s.json() or {}).get("subscription_tier_display")
+            if tier:
+                payload["_tier_display"] = tier
+    except requests.RequestException:
+        pass
+    bot = fetch_grok_bot_usage()
+    if bot:
+        payload["_bot"] = bot
+    return payload
+
+
 # ── Self-update via git ──────────────────────────────────────────────────────
 
 def _git(*args: str, timeout: int = 15) -> subprocess.CompletedProcess[str]:
@@ -237,13 +477,31 @@ def install_update() -> str | None:
     return None
 
 
-def startup_shortcut_path() -> Path:
+APP_NAME = "AI Usage Widget"
+
+
+def _startup_dir() -> Path:
     return (Path(os.environ["APPDATA"]) / "Microsoft" / "Windows"
-            / "Start Menu" / "Programs" / "Startup"
-            / "Claude Usage Widget.lnk")
+            / "Start Menu" / "Programs" / "Startup")
+
+
+def startup_shortcut_path() -> Path:
+    return _startup_dir() / f"{APP_NAME}.lnk"
+
+
+def _migrate_startup_shortcut() -> None:
+    """Rename the old Claude shortcut so 'Launch on startup' stays in sync."""
+    old = _startup_dir() / "Claude Usage Widget.lnk"
+    new = startup_shortcut_path()
+    if old.exists() and not new.exists():
+        try:
+            old.rename(new)
+        except OSError:
+            pass
 
 
 def is_startup_enabled() -> bool:
+    _migrate_startup_shortcut()
     return startup_shortcut_path().exists()
 
 
@@ -269,7 +527,7 @@ def set_startup_enabled(enabled: bool) -> str | None:
         f"$lnk.Arguments = '\"{vbs}\"';"
         f'$lnk.WorkingDirectory = "{REPO_DIR}";'
         + (f'$lnk.IconLocation = "{icon}";' if icon.exists() else "")
-        + '$lnk.Description = "Floating Claude usage widget";'
+        + '$lnk.Description = "Floating AI usage widget";'
           '$lnk.Save()'
     )
     try:
@@ -342,7 +600,6 @@ def _time_progress(resets_at_iso: str, window_s: int | None) -> float | None:
     """Return 0..1 = fraction of the window elapsed; None if window unknown."""
     if not window_s or not resets_at_iso:
         return None
-    from datetime import datetime, timezone
     try:
         dt = datetime.fromisoformat(resets_at_iso.replace("Z", "+00:00"))
     except ValueError:
@@ -355,8 +612,17 @@ def _time_progress(resets_at_iso: str, window_s: int | None) -> float | None:
     return 1.0 - (remaining / window_s)
 
 
+def _week_notches(window_s: int | None) -> int | None:
+    """7 when the bar is a weekly window, so the time bar can mark each day."""
+    if not window_s:
+        return None
+    days = window_s / 86400
+    if 6.5 <= days <= 7.5:
+        return 7
+    return None
+
+
 def _fmt_countdown(resets_at_iso: str) -> str:
-    from datetime import datetime, timezone
     try:
         dt   = datetime.fromisoformat(resets_at_iso.replace("Z", "+00:00"))
         diff = int((dt - datetime.now(timezone.utc)).total_seconds())
@@ -364,13 +630,16 @@ def _fmt_countdown(resets_at_iso: str) -> str:
         return ""
     if diff <= 0:
         return "resetting…"
-    h, rem = divmod(diff, 3600)
+    d, rem = divmod(diff, 86400)
+    h, rem = divmod(rem, 3600)
     m = rem // 60
+    if d:
+        return f"resets in {d}d {h}h"
     return f"resets in {h}h {m}m" if h else f"resets in {m}m"
 
 
-Row = tuple[str, float, str, float | None]
-# (label, utilization 0..1, sublabel, time_progress 0..1 or None)
+Row = tuple[str, float, str, float | None, int | None]
+# (label, utilization 0..1, sublabel, time_progress 0..1 or None, day notches or None)
 
 
 def parse_usage(data: dict) -> list[Row]:
@@ -382,9 +651,11 @@ def parse_usage(data: dict) -> list[Row]:
             continue
         resets_at = tier.get("resets_at") or ""
         util      = float(tier["utilization"]) / 100.0
-        countdown = _fmt_countdown(resets_at)
-        elapsed   = _time_progress(resets_at, TIER_WINDOW_S.get(label))
-        rows.append((label, util, countdown, elapsed))
+        window    = TIER_WINDOW_S.get(label)
+        rows.append((
+            label, util, _fmt_countdown(resets_at),
+            _time_progress(resets_at, window), _week_notches(window),
+        ))
 
     extra = data.get("extra_usage")
     if extra and extra.get("is_enabled"):
@@ -392,7 +663,109 @@ def parse_usage(data: dict) -> list[Row]:
         limit = float(extra.get("monthly_limit") or 0)
         util  = used / limit if limit > 0 else 0.0
         cur   = extra.get("currency", "USD")
-        rows.append(("Extra credits", util, f"{cur} {used:.2f} / {limit:.2f}", None))
+        rows.append(("Extra credits", util, f"{cur} {used:.2f} / {limit:.2f}", None, None))
+
+    return rows
+
+
+def _period_window_s(period_type: str | None, start: str, end: str) -> int | None:
+    t = (period_type or "").upper()
+    if "WEEK" in t:
+        return 7 * 86400
+    if "MONTH" in t:
+        return 30 * 86400
+    if start and end:
+        try:
+            s = datetime.fromisoformat(start.replace("Z", "+00:00"))
+            e = datetime.fromisoformat(end.replace("Z", "+00:00"))
+            secs = int((e - s).total_seconds())
+            return secs if secs > 0 else None
+        except ValueError:
+            return None
+    return None
+
+
+def _period_label(period_type: str | None, window_s: int | None) -> str:
+    t = (period_type or "").upper()
+    if "WEEK" in t:
+        return "Weekly"
+    if "MONTH" in t:
+        return "Monthly"
+    if window_s is not None:
+        days = window_s / 86400
+        if 4 <= days <= 12:
+            return "Weekly"
+        if 20 <= days <= 45:
+            return "Monthly"
+    return "Credits"
+
+
+def _cents_to_dollars(val_obj: object) -> float:
+    if isinstance(val_obj, dict):
+        raw = val_obj.get("val", 0)
+    else:
+        raw = val_obj or 0
+    try:
+        return float(raw) / 100.0
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def parse_grok_usage(data: dict) -> list[Row]:
+    rows: list[Row] = []
+    cfg = data.get("config") or data
+    period = cfg.get("currentPeriod") or {}
+    start = period.get("start") or cfg.get("billingPeriodStart") or ""
+    end   = period.get("end") or cfg.get("billingPeriodEnd") or ""
+    window_s = _period_window_s(period.get("type"), start, end)
+    label = _period_label(period.get("type"), window_s)
+
+    used_pct = cfg.get("creditUsagePercent")
+    if used_pct is None and cfg.get("onDemandCap"):
+        cap = _cents_to_dollars(cfg.get("onDemandCap"))
+        used = _cents_to_dollars(cfg.get("onDemandUsed"))
+        used_pct = (used / cap * 100.0) if cap > 0 else 0.0
+    if used_pct is None:
+        used_pct = 0.0
+
+    countdown = _fmt_countdown(end) if end else ""
+    tier = data.get("_tier_display")
+    sub = f"{tier} · {countdown}" if tier and countdown else (str(tier) if tier else countdown)
+    rows.append((
+        label, float(used_pct) / 100.0, sub,
+        _time_progress(end, window_s) if end else None, _week_notches(window_s),
+    ))
+
+    for item in cfg.get("productUsage") or []:
+        pct = item.get("usagePercent")
+        if pct is None:
+            continue
+        product = item.get("product") or ""
+        rows.append((
+            GROK_PRODUCT_LABELS.get(product, product or "Product"),
+            float(pct) / 100.0, "", None, None,
+        ))
+
+    bot = data.get("_bot") or {}
+    if bot.get("usagePercent") is not None:
+        bot_end = str(bot.get("nextReset") or "")
+        bot_start = str(bot.get("periodStart") or "")
+        bot_window = _period_window_s(None, bot_start, bot_end)
+        rows.append((
+            BOT_LABEL, float(bot["usagePercent"]) / 100.0,
+            _fmt_countdown(bot_end) if bot_end else "",
+            _time_progress(bot_end, bot_window) if bot_end else None,
+            _week_notches(bot_window),
+        ))
+
+    on_cap = _cents_to_dollars(cfg.get("onDemandCap"))
+    on_used = _cents_to_dollars(cfg.get("onDemandUsed"))
+    if on_cap > 0:
+        rows.append(("On-demand", min(on_used / on_cap, 1.0), f"$ {on_used:.2f} / {on_cap:.2f}", None, None))
+
+    prepaid = _cents_to_dollars(cfg.get("prepaidBalance"))
+    if prepaid > 0:
+        rows.append(("Prepaid", 0.0, f"$ {prepaid:.2f} remaining", None, None))
 
     return rows
 
@@ -412,10 +785,13 @@ SEPARATOR    = "#333333"
 BTN_BG       = "#2a2a2a"
 BTN_BG_HOVER = "#3a3a3a"
 TIME_BAR_BG  = "#262626"   # slightly darker than BAR_BG
-TIME_BAR_FG  = "#999999"   # quiet light gray
+TIME_BAR_FG  = "#999999"   # quiet light gray; day notches use this too
 BAR_H        = 6
 TIME_BAR_H   = 2            # slim accent under the usage bar
+TICK_DROP    = 2            # hangs 2px under the time bar (50% taller than 1px)
 WIDTH        = 220
+SOURCE_ORDER = ("claude", "grok")
+SOURCE_TITLE = {"claude": "Claude", "grok": "Grok"}
 
 # Discrete refresh-timer presets, in minutes.
 MINUTE_PRESETS      = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 45, 60]
@@ -451,6 +827,8 @@ class UsageWidget(tk.Tk):
         self._refresh_min = self._init_refresh_minutes()
         self._manage_mode = False
         self._last_rows: list[Row] = []
+        self._panels: dict[str, tuple] = {}
+        self._source = ""
         self._destroyed   = False
         self._fetch_in_flight = False
         self._next_after_id: str | None = None
@@ -491,9 +869,13 @@ class UsageWidget(tk.Tk):
         hdr.pack(fill="x", padx=6, pady=(6, 2))
         self._bind_drag(hdr)
 
-        title = tk.Label(hdr, text="Claude Usage", bg=BG, fg=FG,
+        title = tk.Label(hdr, text="AI Usage", bg=BG, fg=FG,
                          font=("Segoe UI", 9, "bold"), cursor="fleur")
-        title.pack(side="left")
+        # The old Grok widget was sized by the words "Grok Usage". Pad the
+        # shorter title so this window stays that same width.
+        bold = tkfont.Font(family="Segoe UI", size=9, weight="bold")
+        title_pad = max(0, bold.measure("Grok Usage") - bold.measure("AI Usage"))
+        title.pack(side="left", padx=(0, title_pad))
         self._bind_drag(title)
 
         # Header buttons (right-to-left order in the layout).
@@ -510,8 +892,12 @@ class UsageWidget(tk.Tk):
 
         tk.Frame(self, bg=SEPARATOR, height=1).pack(fill="x", padx=6, pady=(0, 4))
 
+        # Second row, only when both accounts are signed in. Kept out of the
+        # title row so the window stays as narrow as the old Grok widget.
+        self._tab_bar = tk.Frame(self, bg=BG)
         self._body = tk.Frame(self, bg=BG)
         self._body.pack(fill="x", padx=8, pady=(0, 4))
+        self._sync_tabs()
         tk.Label(self._body, text="Loading…", bg=BG, fg=FG_DIM,
                  font=("Segoe UI", 8)).pack(anchor="w")
 
@@ -653,7 +1039,7 @@ class UsageWidget(tk.Tk):
             pystray.MenuItem("Quit", quit_app),
         )
         self._tray = pystray.Icon("claude-usage-widget", image,
-                                  "Claude Usage", menu)
+                                  "AI Usage", menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
 
     def _after_safe(self, *args, remember_id: bool = False, **kwargs) -> None:
@@ -699,26 +1085,101 @@ class UsageWidget(tk.Tk):
 
     def _fetch(self) -> None:
         next_delay_s = self._refresh_min * 60
-        try:
-            data = fetch_usage()
-            rows = parse_usage(data)
-            self._after_safe(0, self._on_fetch_success, rows)
-        except Exception as exc:  # noqa: BLE001 — top-level handler for polling loop
-            if is_auth_error(exc):
-                self._after_safe(0, self._show_login)
-            else:
-                self._after_safe(0, self._show_error, str(exc))
-            backoff = retry_after_seconds(exc)
-            if backoff is not None:
-                next_delay_s = max(next_delay_s, backoff)
-        finally:
-            self._fetch_in_flight = False
+        panels: dict[str, tuple] = {}
+        for name in self._enabled_sources():
+            try:
+                if name == "claude":
+                    panels[name] = ("ok", parse_usage(fetch_usage()))
+                else:
+                    panels[name] = ("ok", parse_grok_usage(fetch_grok_usage()))
+            except Exception as exc:  # noqa: BLE001 — one source must not blank the other
+                if isinstance(exc, FileNotFoundError):
+                    continue
+                if is_auth_error(exc):
+                    panels[name] = ("auth",)
+                else:
+                    panels[name] = ("error", str(exc))
+                backoff = retry_after_seconds(exc)
+                if backoff is not None:
+                    next_delay_s = max(next_delay_s, backoff)
+        self._after_safe(0, self._on_fetch_success, panels)
+        self._fetch_in_flight = False
         self._after_safe(next_delay_s * 1000, self._schedule_refresh,
                          remember_id=True)
 
-    def _on_fetch_success(self, rows: list[Row]) -> None:
-        self._render(rows)
+    def _on_fetch_success(self, panels: dict[str, tuple]) -> None:
+        self._panels = panels
+        self._show_active()
         self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
+
+    def _enabled_sources(self) -> list[str]:
+        """Signed-in accounts the user has not hidden. Missing sign-in is skipped."""
+        out: list[str] = []
+        for name in SOURCE_ORDER:
+            connected = claude_connected() if name == "claude" else grok_connected()
+            if not connected:
+                continue
+            if self._settings.get(f"show_{name}") is False:
+                continue
+            out.append(name)
+        return out
+
+    def _sync_tabs(self) -> None:
+        for child in self._tab_bar.winfo_children():
+            child.destroy()
+        sources = self._enabled_sources()
+        if self._source not in sources:
+            saved = self._settings.get("source")
+            self._source = saved if saved in sources else (sources[0] if sources else "")
+        if len(sources) < 2:
+            self._tab_bar.pack_forget()
+            return
+        if not self._tab_bar.winfo_ismapped():
+            self._tab_bar.pack(fill="x", padx=8, pady=(0, 2), before=self._body)
+        for name in sources:
+            active = name == self._source
+            btn = tk.Label(
+                self._tab_bar, text=SOURCE_TITLE[name], bg=BG,
+                fg=FG if active else FG_DIM,
+                font=("Segoe UI", 8, "bold" if active else "normal"),
+                cursor="hand2", bd=0, padx=0, pady=0,
+            )
+            btn.pack(side="left", padx=(0, 10))
+            btn.bind("<Button-1>", lambda _e, n=name: self._select_source(n))
+
+    def _select_source(self, name: str) -> None:
+        if name == self._source:
+            return
+        self._source = name
+        self._settings["source"] = name
+        try:
+            save_settings(self._settings)
+        except OSError:
+            pass
+        self._show_active()
+
+    def _show_active(self) -> None:
+        self._sync_tabs()
+        panel = self._panels.get(self._source)
+        if not panel:
+            self._last_rows = []
+            self._reset_body()
+            return
+        if panel[0] == "ok":
+            self._render(panel[1])
+        elif panel[0] == "auth":
+            self._show_login()
+        else:
+            self._show_error(panel[1] if len(panel) > 1 else "Error")
+
+    def _set_show_source(self, name: str, enabled: bool) -> str | None:
+        self._settings[f"show_{name}"] = bool(enabled)
+        try:
+            save_settings(self._settings)
+        except OSError as exc:
+            return str(exc)
+        self._show_active()
+        return None
 
     def _manual_refresh(self) -> None:
         """User-initiated refresh from the settings panel; debounced via in-flight flag."""
@@ -874,6 +1335,20 @@ class UsageWidget(tk.Tk):
         # ── boolean options ──
         opts = tk.Frame(panel, bg=BG)
         opts.pack(fill="x", pady=(6, 0))
+
+        signed_in = [
+            name for name in SOURCE_ORDER
+            if (claude_connected() if name == "claude" else grok_connected())
+        ]
+        if signed_in:
+            tk.Label(opts, text="Accounts", bg=BG, fg=FG_DIM,
+                     font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(anchor="w")
+            for name in signed_in:
+                self._make_checkbox(
+                    opts, SOURCE_TITLE[name],
+                    get_state=lambda n=name: self._settings.get(f"show_{n}") is not False,
+                    set_state=lambda enabled, n=name: self._set_show_source(n, enabled),
+                )
 
         self._make_checkbox(
             opts, "Launch on startup",
@@ -1226,7 +1701,7 @@ class UsageWidget(tk.Tk):
         return f"Refresh timer: {minutes} {unit}"
 
     def _add_row(self, label: str, util: float, sub: str,
-                 time_progress: float | None) -> None:
+                 time_progress: float | None, day_notches: int | None = None) -> None:
         pct        = min(int(util * 100), 100)
         hidden     = label in self._hidden
         active_fg  = FG_DIM if hidden else FG
@@ -1259,20 +1734,46 @@ class UsageWidget(tk.Tk):
         tk.Frame(usage_bar, bg=active_bar, height=BAR_H).place(
             relx=0, rely=0, relwidth=min(max(util, 0.0), 1.0), relheight=1.0)
 
-        # Time-elapsed bar (flush under the usage bar, no spacing)
         if time_progress is not None:
-            time_bar = tk.Frame(row, bg=TIME_BAR_BG, height=TIME_BAR_H)
-            time_bar.pack(fill="x", pady=0)
-            time_bar.pack_propagate(False)
-            tk.Frame(time_bar, bg=time_fg, height=TIME_BAR_H).place(
-                relx=0, rely=0,
-                relwidth=min(max(time_progress, 0.0), 1.0),
-                relheight=1.0)
+            self._mount_time_bar(row, time_progress, time_fg, day_notches)
 
         if sub:
             tk.Label(row, text=sub, bg=BG, fg=FG_DIM,
                      font=("Segoe UI", 7),
-                     bd=0, padx=0, pady=0).pack(anchor="w")
+                     bd=0, padx=0, pady=0,
+                     wraplength=WIDTH - 24, justify="left").pack(anchor="w")
+
+    def _mount_time_bar(self, parent: tk.Misc, progress: float, fill: str,
+                        days: int | None) -> None:
+        """Light bar under the usage bar. Weekly bars get a notch per day."""
+        drop = TICK_DROP if days else 0
+        height = TIME_BAR_H + drop
+        # width=1: Tk's canvas default is ~10cm and was stretching the window.
+        canvas = tk.Canvas(
+            parent, width=1, height=height, bg=BG, highlightthickness=0, bd=0,
+        )
+        canvas.pack(fill="x")
+        tick = fill
+
+        def redraw(_event: tk.Event | None = None) -> None:
+            canvas.delete("all")
+            width = canvas.winfo_width()
+            if width < 2:
+                return
+            prog = min(max(progress, 0.0), 1.0)
+            canvas.create_rectangle(0, 0, width, TIME_BAR_H, fill=TIME_BAR_BG, width=0)
+            canvas.create_rectangle(
+                0, 0, max(1, round(width * prog)), TIME_BAR_H, fill=fill, width=0,
+            )
+            if not days or days < 2:
+                return
+            # Start, end, and one notch at each day boundary between them.
+            last = width - 1
+            for i in range(days + 1):
+                x = round(i * last / days)
+                canvas.create_rectangle(x, 0, x + 1, height, fill=tick, width=0)
+
+        canvas.bind("<Configure>", redraw)
 
     def _reset_body(self) -> None:
         for w in self._body.winfo_children():
@@ -1282,7 +1783,10 @@ class UsageWidget(tk.Tk):
         self._reset_body()
         tk.Label(self._body, text="Not logged in", bg=BG, fg=FG_DIM,
                  font=("Segoe UI", 8)).pack(anchor="w")
-        tk.Label(self._body, text="Run 'claude' in a terminal\nto refresh credentials.",
+        hint = ("Run 'grok login' in a terminal\nto refresh credentials."
+                if self._source == "grok"
+                else "Run 'claude' in a terminal\nto refresh credentials.")
+        tk.Label(self._body, text=hint,
                  bg=BG, fg=FG, font=("Segoe UI", 8), justify="left",
                  wraplength=WIDTH - 20).pack(anchor="w", pady=(4, 0))
         self._ts_lbl.config(text="")

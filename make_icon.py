@@ -1,7 +1,8 @@
-"""Generate claude_widget.ico — Claude starburst over two usage bars.
+"""Generate claude_widget.ico — Claude and Grok marks over two usage bars.
 
-The starburst path is the same one used by Claude Desktop's `AppLogo`.
-Run once after editing constants; the .ico is committed to the repo.
+The starburst path is Claude Desktop's `AppLogo`. The Grok mark is the
+committed PNG from the grok-usage-widget repo, sitting next to this one.
+Run once after editing; the .ico and .png are what the widget loads.
 """
 
 from __future__ import annotations
@@ -71,17 +72,42 @@ def rasterize_path(path_d: str, fill: str, size: int, viewbox: int = 248) -> Ima
     return img
 
 
+def _load_grok_mark(size: int) -> Image.Image:
+    """Light-gray Grok mark. Near-black pixels are treated as background."""
+    src = Path(__file__).resolve().parent.parent / "grok-usage-widget" / "grok_mark.png"
+    im = Image.open(src).convert("RGBA")
+    px = im.load()
+    for y in range(im.height):
+        for x in range(im.width):
+            r, g, b, a = px[x, y]
+            if a < 20 or (r < 40 and g < 40 and b < 40):
+                px[x, y] = (0, 0, 0, 0)
+            else:
+                px[x, y] = (232, 232, 232, a)
+    bbox = im.split()[-1].getbbox()
+    if bbox:
+        im = im.crop(bbox)
+    im.thumbnail((size, size), Image.LANCZOS)
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    canvas.alpha_composite(im, ((size - im.width) // 2, (size - im.height) // 2))
+    return canvas
+
+
 def draw_icon(size: int) -> Image.Image:
     scale = 4
     s = size * scale
     img = Image.new("RGBA", (s, s), BG_COLOR)
 
-    # Top 2/3: Claude starburst, centered horizontally
-    star_size = int(s * 0.66)
-    star = rasterize_path(CLAUDE_STARBURST_PATH, CLAUDE_STARBURST_FILL, star_size)
-    star_x = (s - star_size) // 2
-    star_y = int(s * 0.02)
-    img.alpha_composite(star, (star_x, star_y))
+    # Top: Claude starburst and Grok mark, side by side
+    mark = int(s * 0.40)
+    gap = int(s * 0.06)
+    pair = mark * 2 + gap
+    left = (s - pair) // 2
+    top = int(s * 0.06)
+    star = rasterize_path(CLAUDE_STARBURST_PATH, CLAUDE_STARBURST_FILL, mark)
+    grok = _load_grok_mark(mark)
+    img.alpha_composite(star, (left, top))
+    img.alpha_composite(grok, (left + mark + gap, top))
 
     # Bottom 1/3: two full-width bars (first biggest, second halfway)
     d = ImageDraw.Draw(img)

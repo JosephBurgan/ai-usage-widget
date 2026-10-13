@@ -1,4 +1,4 @@
-# Claude Usage Widget — one-command setup.
+# AI Usage Widget — one-command setup.
 # Usage:  Right-click → "Run with PowerShell"
 #   or:   powershell -ExecutionPolicy Bypass -File setup.ps1
 
@@ -23,12 +23,14 @@ python -m pip install --quiet --user -r (Join-Path $repo "requirements.txt")
 Write-Host "Creating Start Menu shortcut..." -ForegroundColor Cyan
 $sh  = New-Object -ComObject WScript.Shell
 $dir = Join-Path $env:APPDATA "Microsoft\Windows\Start Menu\Programs"
-$lnk = $sh.CreateShortcut((Join-Path $dir "Claude Usage Widget.lnk"))
+$oldLnk = Join-Path $dir "Claude Usage Widget.lnk"
+if (Test-Path $oldLnk) { Remove-Item $oldLnk -Force }
+$lnk = $sh.CreateShortcut((Join-Path $dir "AI Usage Widget.lnk"))
 $lnk.TargetPath       = "wscript.exe"
 $lnk.Arguments        = "`"$vbs`""
 $lnk.WorkingDirectory = $repo
 if (Test-Path $icon) { $lnk.IconLocation = $icon }
-$lnk.Description      = "Floating Claude usage widget"
+$lnk.Description      = "Floating AI usage widget"
 $lnk.Save()
 
 # Note: "Launch on startup" is opt-in via the widget's settings panel.
