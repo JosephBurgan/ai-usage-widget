@@ -638,8 +638,27 @@ def _fmt_countdown(resets_at_iso: str) -> str:
     return f"resets in {h}h {m}m" if h else f"resets in {m}m"
 
 
-Row = tuple[str, float, str, float | None, int | None]
-# (label, utilization 0..1, sublabel, time_progress 0..1 or None, day notches or None)
+def _fmt_reset_clock(resets_at_iso: str) -> str:
+    """Local weekday and clock, e.g. 'Friday 5:00AM'."""
+    try:
+        dt = datetime.fromisoformat(resets_at_iso.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    local = dt.astimezone()
+    hour24 = local.hour
+    suffix = "AM" if hour24 < 12 else "PM"
+    hour = hour24 % 12 or 12
+    return f"{local.strftime('%A')} {hour}:{local.minute:02d}{suffix}"
+
+
+def _weekly_reset_clock(resets_at_iso: str, window_s: int | None) -> str:
+    if _week_notches(window_s) != 7 or not resets_at_iso:
+        return ""
+    return _fmt_reset_clock(resets_at_iso)
+
+
+Row = tuple[str, float, str, float | None, int | None, str]
+# (label, utilization 0..1, sublabel, time_progress, day notches, weekly reset clock)
 
 
 def parse_usage(data: dict) -> list[Row]:
@@ -655,6 +674,7 @@ def parse_usage(data: dict) -> list[Row]:
         rows.append((
             label, util, _fmt_countdown(resets_at),
             _time_progress(resets_at, window), _week_notches(window),
+            _weekly_reset_clock(resets_at, window),
         ))
 
     extra = data.get("extra_usage")
@@ -663,7 +683,7 @@ def parse_usage(data: dict) -> list[Row]:
         limit = float(extra.get("monthly_limit") or 0)
         util  = used / limit if limit > 0 else 0.0
         cur   = extra.get("currency", "USD")
-        rows.append(("Extra credits", util, f"{cur} {used:.2f} / {limit:.2f}", None, None))
+        rows.append(("Extra credits", util, f"{cur} {used:.2f} / {limit:.2f}", None, None, ""))
 
     return rows
 
@@ -734,6 +754,7 @@ def parse_grok_usage(data: dict) -> list[Row]:
     rows.append((
         label, float(used_pct) / 100.0, sub,
         _time_progress(end, window_s) if end else None, _week_notches(window_s),
+        _weekly_reset_clock(end, window_s),
     ))
 
     for item in cfg.get("productUsage") or []:
@@ -743,7 +764,7 @@ def parse_grok_usage(data: dict) -> list[Row]:
         product = item.get("product") or ""
         rows.append((
             GROK_PRODUCT_LABELS.get(product, product or "Product"),
-            float(pct) / 100.0, "", None, None,
+            float(pct) / 100.0, "", None, None, "",
         ))
 
     bot = data.get("_bot") or {}
@@ -756,16 +777,17 @@ def parse_grok_usage(data: dict) -> list[Row]:
             _fmt_countdown(bot_end) if bot_end else "",
             _time_progress(bot_end, bot_window) if bot_end else None,
             _week_notches(bot_window),
+            _weekly_reset_clock(bot_end, bot_window),
         ))
 
     on_cap = _cents_to_dollars(cfg.get("onDemandCap"))
     on_used = _cents_to_dollars(cfg.get("onDemandUsed"))
     if on_cap > 0:
-        rows.append(("On-demand", min(on_used / on_cap, 1.0), f"$ {on_used:.2f} / {on_cap:.2f}", None, None))
+        rows.append(("On-demand", min(on_used / on_cap, 1.0), f"$ {on_used:.2f} / {on_cap:.2f}", None, None, ""))
 
     prepaid = _cents_to_dollars(cfg.get("prepaidBalance"))
     if prepaid > 0:
-        rows.append(("Prepaid", 0.0, f"$ {prepaid:.2f} remaining", None, None))
+        rows.append(("Prepaid", 0.0, f"$ {prepaid:.2f} remaining", None, None, ""))
 
     return rows
 
@@ -851,6 +873,11 @@ class UsageWidget(tk.Tk):
         self._build_ui()
         self._apply_icon()
         self.update_idletasks()
+        # Header sets the width. A later row (the Grok plan line) must not
+        # stretch the window past the Claude tab.
+        self._chrome_w = self.winfo_reqwidth()
+        self.minsize(self._chrome_w, 1)
+        self.maxsize(self._chrome_w, self.winfo_screenheight())
         self._place_initial()
         self.lift()
 
@@ -1214,7 +1241,7 @@ class UsageWidget(tk.Tk):
         if not visible and not self._manage_mode:
             tk.Label(self._body, text="All rows hidden — click ≡ to show some",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 8),
-                     wraplength=WIDTH - 20).pack(anchor="w")
+                     wraplength=self._inner_w()).pack(anchor="w")
         else:
             for row in visible:
                 self._add_row(*row)
@@ -1268,7 +1295,7 @@ class UsageWidget(tk.Tk):
         if s == "error" and self._deps_install_error:
             tk.Label(self._body, text=self._deps_install_error,
                      bg=BG, fg=BAR_HIGH, font=("Segoe UI", 7),
-                     wraplength=WIDTH - 20, justify="left",
+                     wraplength=self._inner_w(), justify="left",
                      bd=0, padx=0, pady=0).pack(anchor="w", pady=(0, 4))
 
     def _on_install_deps(self) -> None:
@@ -1700,8 +1727,49 @@ class UsageWidget(tk.Tk):
         unit = "min" if minutes == 1 else "min"
         return f"Refresh timer: {minutes} {unit}"
 
+    def _ui_font(self, size: int, bold: bool = False) -> tkfont.Font:
+        cache = getattr(self, "_ui_fonts", None)
+        if cache is None:
+            cache = {}
+            self._ui_fonts = cache
+        key = (size, bold)
+        font = cache.get(key)
+        if font is None:
+            font = tkfont.Font(
+                family="Segoe UI", size=size,
+                weight="bold" if bold else "normal",
+            )
+            cache[key] = font
+        return font
+
+    def _inner_w(self) -> int:
+        chrome = getattr(self, "_chrome_w", 0) or WIDTH
+        return max(40, chrome - 16)
+
+    @staticmethod
+    def _split_plan(sub: str) -> tuple[str, str]:
+        mark = " · "
+        if mark in sub:
+            tier, rest = sub.split(mark, 1)
+            return tier, rest
+        return "", sub
+
+    def _fit_clock(self, left: str, right: str) -> str:
+        """Use a 3-letter weekday when the full name would widen the window."""
+        if not right:
+            return right
+        font = self._ui_font(7)
+        inner = self._inner_w()
+        if font.measure(left) + font.measure(right) <= inner:
+            return right
+        day, _, rest = right.partition(" ")
+        if rest and len(day) > 3:
+            return f"{day[:3]} {rest}"
+        return right
+
     def _add_row(self, label: str, util: float, sub: str,
-                 time_progress: float | None, day_notches: int | None = None) -> None:
+                 time_progress: float | None, day_notches: int | None = None,
+                 reset_when: str = "") -> None:
         pct        = min(int(util * 100), 100)
         hidden     = label in self._hidden
         active_fg  = FG_DIM if hidden else FG
@@ -1737,11 +1805,29 @@ class UsageWidget(tk.Tk):
         if time_progress is not None:
             self._mount_time_bar(row, time_progress, time_fg, day_notches)
 
-        if sub:
-            tk.Label(row, text=sub, bg=BG, fg=FG_DIM,
-                     font=("Segoe UI", 7),
-                     bd=0, padx=0, pady=0,
-                     wraplength=WIDTH - 24, justify="left").pack(anchor="w")
+        if sub or reset_when:
+            tier, detail = self._split_plan(sub)
+            if tier:
+                tk.Label(row, text=tier, bg=BG, fg=FG_DIM,
+                         font=("Segoe UI", 7), bd=0, padx=0, pady=0,
+                         wraplength=self._inner_w(), justify="left",
+                         ).pack(anchor="w")
+            clock = self._fit_clock(detail, reset_when)
+            if detail or clock:
+                line = tk.Frame(row, bg=BG)
+                line.pack(fill="x")
+                if clock:
+                    tk.Label(line, text=clock, bg=BG, fg=FG_DIM,
+                             font=("Segoe UI", 7),
+                             bd=0, padx=0, pady=0).pack(side="right")
+                if detail:
+                    room = self._inner_w()
+                    if clock:
+                        room = max(40, room - self._ui_font(7).measure(clock) - 4)
+                    tk.Label(line, text=detail, bg=BG, fg=FG_DIM,
+                             font=("Segoe UI", 7),
+                             bd=0, padx=0, pady=0,
+                             wraplength=room, justify="left").pack(side="left")
 
     def _mount_time_bar(self, parent: tk.Misc, progress: float, fill: str,
                         days: int | None) -> None:
@@ -1788,13 +1874,13 @@ class UsageWidget(tk.Tk):
                 else "Run 'claude' in a terminal\nto refresh credentials.")
         tk.Label(self._body, text=hint,
                  bg=BG, fg=FG, font=("Segoe UI", 8), justify="left",
-                 wraplength=WIDTH - 20).pack(anchor="w", pady=(4, 0))
+                 wraplength=self._inner_w()).pack(anchor="w", pady=(4, 0))
         self._ts_lbl.config(text="")
 
     def _show_error(self, msg: str) -> None:
         self._reset_body()
         tk.Label(self._body, text=f"Error: {msg}", bg=BG, fg=BAR_HIGH,
-                 font=("Segoe UI", 7), wraplength=WIDTH - 20,
+                 font=("Segoe UI", 7), wraplength=self._inner_w(),
                  justify="left").pack(anchor="w")
         self._ts_lbl.config(text=time.strftime("Failed %H:%M:%S"))
 
