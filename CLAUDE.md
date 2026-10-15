@@ -1,7 +1,7 @@
 # ai-usage-widget — project standards
 
 GitHub: https://github.com/JosephBurgan/ai-usage-widget
-The checkout on this PC is still `C:\Users\Joseph\claude-usage-widget`.
+The checkout on this PC is `C:\Users\Joseph\ai-usage-widget`.
 
 Standing rules for any agent working in this repo. Read before editing or pushing.
 
@@ -31,7 +31,7 @@ Before every push, state the chosen version and bump category to the user and wa
 Hard rule: **never push without explicit user approval**.
 
 Order:
-1. Edit `claude-usage-widget\claude_widget.py` (the repo copy).
+1. Edit `ai-usage-widget\claude_widget.py` (the repo copy).
 2. `python -m py_compile` it. No syntax errors before continuing.
 3. `Copy-Item` repo file → `C:\Users\Joseph\claude_widget.py` (live runtime).
 4. Kill `pythonw*`, relaunch via `wscript` on the `.vbs`.
@@ -54,7 +54,7 @@ Order:
 
 ## Sync target
 
-- Repo: `C:\Users\Joseph\claude-usage-widget\` — edit here.
+- Repo: `C:\Users\Joseph\ai-usage-widget\` — edit here.
 - Live runtime: `C:\Users\Joseph\claude_widget.py` — keep in sync after every edit.
 - VBS launcher: `claude_widget.vbs` (self-locating, no console flash).
 
