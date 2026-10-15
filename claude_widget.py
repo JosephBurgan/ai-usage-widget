@@ -152,6 +152,36 @@ def claude_connected() -> bool:
     return bool(oauth.get("accessToken") and oauth.get("refreshToken"))
 
 
+def claude_plan_label() -> str:
+    """Short plan name from the saved Claude sign-in, e.g. 'Max 20x'."""
+    try:
+        oauth = _read_json(CREDS_FILE).get("claudeAiOauth") or {}
+    except (OSError, json.JSONDecodeError, KeyError):
+        return ""
+    tier = str(oauth.get("rateLimitTier") or "").lower()
+    kind = str(oauth.get("subscriptionType") or "").lower()
+    if "20x" in tier:
+        return "Max 20x"
+    if "5x" in tier:
+        return "Max 5x"
+    names = {
+        "pro": "Pro",
+        "max": "Max",
+        "team": "Team",
+        "enterprise": "Enterprise",
+        "free": "Free",
+    }
+    if kind in names:
+        return names[kind]
+    if "pro" in tier:
+        return "Pro"
+    if "team" in tier:
+        return "Team"
+    if "enterprise" in tier:
+        return "Enterprise"
+    return ""
+
+
 # ── Grok (optional second source) ────────────────────────────────────────────
 
 GROK_CLIENT_ID = "b1a00492-073a-47ea-816f-4c329264a828"
@@ -731,7 +761,7 @@ def _cents_to_dollars(val_obj: object) -> float:
         return 0.0
 
 
-def parse_grok_usage(data: dict) -> list[Row]:
+def parse_grok_usage(data: dict) -> tuple[list[Row], str]:
     rows: list[Row] = []
     cfg = data.get("config") or data
     period = cfg.get("currentPeriod") or {}
@@ -749,10 +779,8 @@ def parse_grok_usage(data: dict) -> list[Row]:
         used_pct = 0.0
 
     countdown = _fmt_countdown(end) if end else ""
-    tier = data.get("_tier_display")
-    sub = f"{tier} · {countdown}" if tier and countdown else (str(tier) if tier else countdown)
     rows.append((
-        label, float(used_pct) / 100.0, sub,
+        label, float(used_pct) / 100.0, countdown,
         _time_progress(end, window_s) if end else None, _week_notches(window_s),
         _weekly_reset_clock(end, window_s),
     ))
@@ -789,7 +817,7 @@ def parse_grok_usage(data: dict) -> list[Row]:
     if prepaid > 0:
         rows.append(("Prepaid", 0.0, f"$ {prepaid:.2f} remaining", None, None, ""))
 
-    return rows
+    return rows, str(data.get("_tier_display") or "")
 
 
 # ── Widget ────────────────────────────────────────────────────────────────────
@@ -849,6 +877,7 @@ class UsageWidget(tk.Tk):
         self._refresh_min = self._init_refresh_minutes()
         self._manage_mode = False
         self._last_rows: list[Row] = []
+        self._plan = ""
         self._panels: dict[str, tuple] = {}
         self._source = ""
         self._destroyed   = False
@@ -1116,9 +1145,10 @@ class UsageWidget(tk.Tk):
         for name in self._enabled_sources():
             try:
                 if name == "claude":
-                    panels[name] = ("ok", parse_usage(fetch_usage()))
+                    panels[name] = ("ok", parse_usage(fetch_usage()), claude_plan_label())
                 else:
-                    panels[name] = ("ok", parse_grok_usage(fetch_grok_usage()))
+                    rows, plan = parse_grok_usage(fetch_grok_usage())
+                    panels[name] = ("ok", rows, plan)
             except Exception as exc:  # noqa: BLE001 — one source must not blank the other
                 if isinstance(exc, FileNotFoundError):
                     continue
@@ -1190,9 +1220,11 @@ class UsageWidget(tk.Tk):
         panel = self._panels.get(self._source)
         if not panel:
             self._last_rows = []
+            self._plan = ""
             self._reset_body()
             return
         if panel[0] == "ok":
+            self._plan = panel[2] if len(panel) > 2 else ""
             self._render(panel[1])
         elif panel[0] == "auth":
             self._show_login()
@@ -1227,6 +1259,8 @@ class UsageWidget(tk.Tk):
         for w in self._body.winfo_children():
             w.destroy()
 
+        self._add_plan_header(self._plan)
+
         if self._manage_mode:
             # Settings live in a separate popup; main body just shows every row
             # with its hide-checkbox so the user can toggle visibility.
@@ -1247,6 +1281,16 @@ class UsageWidget(tk.Tk):
                 self._add_row(*row)
 
         self.update_idletasks()
+
+    def _add_plan_header(self, plan: str) -> None:
+        """Plan name at the top of the tab, above every meter."""
+        if not plan:
+            return
+        tk.Label(
+            self._body, text=plan, bg=BG, fg=FG_DIM,
+            font=("Segoe UI", 7), bd=0, padx=0, pady=0,
+            wraplength=self._inner_w(), justify="left",
+        ).pack(anchor="w", pady=(0, 2))
 
     def _add_update_banner(self) -> None:
         btn = tk.Label(
