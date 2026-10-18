@@ -1,7 +1,8 @@
-"""Usage widget — floating always-on-top window for Claude and Grok plan usage.
+"""Usage widget — floating always-on-top window for Claude, Grok, and ChatGPT plan usage.
 
 Claude reads ~/.claude/.credentials.json. Grok reads ~/.grok/auth.json.
-A source with no saved sign-in is left off the window. No prompt, no error.
+Tabs show only when the account is checked in settings. Sign in / Sign out
+are in settings; an unchecked account never gets a tab.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+import webbrowser
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
@@ -189,7 +191,7 @@ GROK_BILLING   = "https://cli-chat-proxy.grok.com/v1/billing?format=credits"
 GROK_SETTINGS  = "https://cli-chat-proxy.grok.com/v1/settings"
 GROK_AUTH_HDR  = {"x-xai-token-auth": "xai-grok-cli", "Accept": "application/json"}
 BOT_USAGE_URL  = "https://api2.cursor.sh/aiserver.v1.DashboardService/GetSandUsageStatus"
-BOT_LABEL      = "Bot"
+BOT_LABEL      = "Bot app"
 GROK_TOKEN_REFRESH_MARGIN_S = 5 * 60
 
 GROK_PRODUCT_LABELS = {
@@ -198,6 +200,7 @@ GROK_PRODUCT_LABELS = {
     "GrokImagine": "Imagine",
     "GrokVoice":   "Voice",
     "GrokAPI":     "API",
+    "GrokBot":     "Grok Bot",
 }
 
 
@@ -208,6 +211,41 @@ def grok_connected() -> bool:
     except (OSError, json.JSONDecodeError, KeyError):
         return False
     return True
+
+
+CHATGPT_AUTH = HOME / ".chatgpt_widget_auth.json"
+
+
+def chatgpt_connected() -> bool:
+    """True when the widget has a saved ChatGPT sign-in. Not built yet."""
+    try:
+        data = _read_json(CHATGPT_AUTH)
+    except (OSError, json.JSONDecodeError):
+        return False
+    return bool(data.get("accessToken") or data.get("access_token"))
+
+
+def source_has_creds(name: str) -> bool:
+    if name == "claude":
+        return claude_connected()
+    if name == "grok":
+        return grok_connected()
+    if name == "chatgpt":
+        return chatgpt_connected()
+    return False
+
+
+LOGIN_URLS = {
+    "claude":  "https://claude.ai/login",
+    "grok":    "https://grok.com",
+    "chatgpt": "https://chatgpt.com",
+}
+
+LOGIN_HINTS = {
+    "claude":  "Run 'claude' in a terminal\nto refresh credentials.",
+    "grok":    "Run 'grok login' in a terminal\nto refresh credentials.",
+    "chatgpt": "Sign in on chatgpt.com.\nUsage meters for ChatGPT\nare not wired up yet.",
+}
 
 
 def _parse_expires_at(raw: object) -> float | None:
@@ -840,8 +878,10 @@ BAR_H        = 6
 TIME_BAR_H   = 2            # slim accent under the usage bar
 TICK_DROP    = 2            # hangs 2px under the time bar (50% taller than 1px)
 WIDTH        = 220
-SOURCE_ORDER = ("claude", "grok")
-SOURCE_TITLE = {"claude": "Claude", "grok": "Grok"}
+SOURCE_ORDER = ("claude", "grok", "chatgpt")
+SOURCE_TITLE = {"claude": "Claude", "grok": "Grok", "chatgpt": "ChatGPT"}
+# ChatGPT starts off. Claude/Grok stay on for existing installs.
+SOURCE_SHOW_DEFAULT = {"claude": True, "grok": True, "chatgpt": False}
 
 # Discrete refresh-timer presets, in minutes.
 MINUTE_PRESETS      = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 15, 20, 25, 30, 45, 60]
@@ -892,6 +932,7 @@ class UsageWidget(tk.Tk):
 
         # Settings popup (created on demand when ≡ pressed)
         self._settings_win: tk.Toplevel | None = None
+        self._accounts_frame: tk.Frame | None = None
 
         # Tray state
         self._tray = None  # set by _setup_tray if pystray is available
@@ -946,7 +987,7 @@ class UsageWidget(tk.Tk):
         # Pin starts pinned (white) since the window initializes topmost
         self._pin_btn.config(fg="white")
 
-        tk.Frame(self, bg=SEPARATOR, height=1).pack(fill="x", padx=6, pady=(0, 4))
+        tk.Frame(self, bg=SEPARATOR, height=1).pack(fill="x", padx=6, pady=(0, 2))
 
         # Second row, only when both accounts are signed in. Kept out of the
         # title row so the window stays as narrow as the old Grok widget.
@@ -1143,16 +1184,19 @@ class UsageWidget(tk.Tk):
         next_delay_s = self._refresh_min * 60
         panels: dict[str, tuple] = {}
         for name in self._enabled_sources():
+            if not self._source_signed_in(name):
+                panels[name] = ("auth",)
+                continue
             try:
                 if name == "claude":
                     panels[name] = ("ok", parse_usage(fetch_usage()), claude_plan_label())
-                else:
+                elif name == "grok":
                     rows, plan = parse_grok_usage(fetch_grok_usage())
                     panels[name] = ("ok", rows, plan)
+                else:
+                    panels[name] = ("auth",)
             except Exception as exc:  # noqa: BLE001 — one source must not blank the other
-                if isinstance(exc, FileNotFoundError):
-                    continue
-                if is_auth_error(exc):
+                if is_auth_error(exc) or isinstance(exc, FileNotFoundError):
                     panels[name] = ("auth",)
                 else:
                     panels[name] = ("error", str(exc))
@@ -1169,17 +1213,27 @@ class UsageWidget(tk.Tk):
         self._show_active()
         self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
 
+    def _show_source(self, name: str) -> bool:
+        default = SOURCE_SHOW_DEFAULT.get(name, False)
+        val = self._settings.get(f"show_{name}")
+        if val is None:
+            return default
+        return bool(val)
+
+    def _signed_out_set(self) -> set[str]:
+        raw = self._settings.get("signed_out") or []
+        if isinstance(raw, list):
+            return set(raw)
+        return set()
+
+    def _source_signed_in(self, name: str) -> bool:
+        if name in self._signed_out_set():
+            return False
+        return source_has_creds(name)
+
     def _enabled_sources(self) -> list[str]:
-        """Signed-in accounts the user has not hidden. Missing sign-in is skipped."""
-        out: list[str] = []
-        for name in SOURCE_ORDER:
-            connected = claude_connected() if name == "claude" else grok_connected()
-            if not connected:
-                continue
-            if self._settings.get(f"show_{name}") is False:
-                continue
-            out.append(name)
-        return out
+        """Accounts the user checked in settings. Sign-in is not required to show a tab."""
+        return [name for name in SOURCE_ORDER if self._show_source(name)]
 
     def _sync_tabs(self) -> None:
         for child in self._tab_bar.winfo_children():
@@ -1193,16 +1247,31 @@ class UsageWidget(tk.Tk):
             return
         if not self._tab_bar.winfo_ismapped():
             self._tab_bar.pack(fill="x", padx=8, pady=(0, 2), before=self._body)
+        row = tk.Frame(self._tab_bar, bg=BG)
+        row.pack(fill="x")
         for name in sources:
-            active = name == self._source
-            btn = tk.Label(
-                self._tab_bar, text=SOURCE_TITLE[name], bg=BG,
-                fg=FG if active else FG_DIM,
-                font=("Segoe UI", 8, "bold" if active else "normal"),
-                cursor="hand2", bd=0, padx=0, pady=0,
-            )
-            btn.pack(side="left", padx=(0, 10))
-            btn.bind("<Button-1>", lambda _e, n=name: self._select_source(n))
+            self._add_tab(row, name, name == self._source)
+        tk.Frame(self._tab_bar, bg=SEPARATOR, height=1).pack(fill="x")
+
+    def _add_tab(self, parent: tk.Misc, name: str, active: bool) -> None:
+        bg = BTN_BG if active else BG
+        bd = FG_DIM if active else ACCENT_OFF
+        wrap = tk.Frame(
+            parent, bg=bg, highlightthickness=1,
+            highlightbackground=bd, highlightcolor=bd, cursor="hand2",
+        )
+        wrap.pack(side="left")
+        many = len(self._enabled_sources()) >= 3
+        lbl = tk.Label(
+            wrap, text=SOURCE_TITLE[name], bg=bg,
+            fg=FG if active else FG_DIM,
+            font=("Segoe UI", 8, "bold" if active else "normal"),
+            cursor="hand2", bd=0, padx=4 if many else 6, pady=1,
+        )
+        lbl.pack()
+        handler = lambda _e, n=name: self._select_source(n)
+        wrap.bind("<Button-1>", handler)
+        lbl.bind("<Button-1>", handler)
 
     def _select_source(self, name: str) -> None:
         if name == self._source:
@@ -1217,6 +1286,14 @@ class UsageWidget(tk.Tk):
 
     def _show_active(self) -> None:
         self._sync_tabs()
+        if not self._enabled_sources():
+            self._last_rows = []
+            self._plan = ""
+            self._reset_body()
+            tk.Label(self._body, text="No accounts enabled.\nCheck one in ≡ settings.",
+                     bg=BG, fg=FG_DIM, font=("Segoe UI", 8), justify="left",
+                     wraplength=self._inner_w()).pack(anchor="w")
+            return
         panel = self._panels.get(self._source)
         if not panel:
             self._last_rows = []
@@ -1237,8 +1314,44 @@ class UsageWidget(tk.Tk):
             save_settings(self._settings)
         except OSError as exc:
             return str(exc)
+        if enabled and not self._source:
+            self._source = name
+        if enabled and self._source not in self._enabled_sources():
+            self._source = name
         self._show_active()
+        if enabled and name not in self._panels:
+            self._manual_refresh()
         return None
+
+    def _sign_in(self, name: str) -> None:
+        gone = self._signed_out_set()
+        gone.discard(name)
+        self._settings["signed_out"] = sorted(gone)
+        try:
+            save_settings(self._settings)
+        except OSError:
+            pass
+        if not source_has_creds(name):
+            url = LOGIN_URLS.get(name)
+            if url:
+                webbrowser.open(url)
+        self._refresh_account_rows()
+        if self._show_source(name):
+            self._source = name
+        self._show_active()
+        self._manual_refresh()
+
+    def _sign_out(self, name: str) -> None:
+        gone = self._signed_out_set()
+        gone.add(name)
+        self._settings["signed_out"] = sorted(gone)
+        try:
+            save_settings(self._settings)
+        except OSError:
+            pass
+        self._refresh_account_rows()
+        self._show_active()
+        self._manual_refresh()
 
     def _manual_refresh(self) -> None:
         """User-initiated refresh from the settings panel; debounced via in-flight flag."""
@@ -1407,19 +1520,11 @@ class UsageWidget(tk.Tk):
         opts = tk.Frame(panel, bg=BG)
         opts.pack(fill="x", pady=(6, 0))
 
-        signed_in = [
-            name for name in SOURCE_ORDER
-            if (claude_connected() if name == "claude" else grok_connected())
-        ]
-        if signed_in:
-            tk.Label(opts, text="Accounts", bg=BG, fg=FG_DIM,
-                     font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(anchor="w")
-            for name in signed_in:
-                self._make_checkbox(
-                    opts, SOURCE_TITLE[name],
-                    get_state=lambda n=name: self._settings.get(f"show_{n}") is not False,
-                    set_state=lambda enabled, n=name: self._set_show_source(n, enabled),
-                )
+        tk.Label(opts, text="Accounts", bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(anchor="w")
+        self._accounts_frame = tk.Frame(opts, bg=BG)
+        self._accounts_frame.pack(fill="x")
+        self._refresh_account_rows()
 
         self._make_checkbox(
             opts, "Launch on startup",
@@ -1911,15 +2016,65 @@ class UsageWidget(tk.Tk):
 
     def _show_login(self) -> None:
         self._reset_body()
-        tk.Label(self._body, text="Not logged in", bg=BG, fg=FG_DIM,
+        name = self._source
+        tk.Label(self._body, text="Not signed in", bg=BG, fg=FG_DIM,
                  font=("Segoe UI", 8)).pack(anchor="w")
-        hint = ("Run 'grok login' in a terminal\nto refresh credentials."
-                if self._source == "grok"
-                else "Run 'claude' in a terminal\nto refresh credentials.")
+        hint = LOGIN_HINTS.get(name, "Sign in to connect this account.")
         tk.Label(self._body, text=hint,
                  bg=BG, fg=FG, font=("Segoe UI", 8), justify="left",
                  wraplength=self._inner_w()).pack(anchor="w", pady=(4, 0))
+        btn = self._make_action_button(
+            self._body, "Sign in", lambda n=name: self._sign_in(n),
+        )
+        btn.pack(fill="x", pady=(8, 0))
         self._ts_lbl.config(text="")
+
+    def _refresh_account_rows(self) -> None:
+        frame = getattr(self, "_accounts_frame", None)
+        if frame is None or not frame.winfo_exists():
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        for name in SOURCE_ORDER:
+            self._add_account_row(frame, name)
+
+    def _add_account_row(self, parent: tk.Misc, name: str) -> None:
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=(2, 0))
+
+        signed = self._source_signed_in(name)
+        action = "Sign out" if signed else "Sign in"
+        cb = (lambda n=name: self._sign_out(n)) if signed else (lambda n=name: self._sign_in(n))
+        btn = tk.Label(
+            row, text=action, bg=BTN_BG, fg=FG, font=("Segoe UI", 7),
+            cursor="hand2", bd=0, padx=6, pady=1,
+            width=8, anchor="center",
+        )
+        btn.pack(side="right")
+        btn.bind("<Button-1>", lambda _e, c=cb: c())
+        btn.bind("<Enter>", lambda _e, b=btn: b.config(bg=BTN_BG_HOVER))
+        btn.bind("<Leave>", lambda _e, b=btn: b.config(bg=BTN_BG))
+
+        state = {"on": self._show_source(name)}
+        box = tk.Label(row, text="☑" if state["on"] else "☐",
+                       bg=BG, fg=FG, font=("Segoe UI", 9),
+                       cursor="hand2", bd=0, padx=0, pady=0)
+        box.pack(side="left", padx=(0, 4))
+        lbl = tk.Label(row, text=SOURCE_TITLE[name], bg=BG, fg=FG,
+                       font=("Segoe UI", 8), cursor="hand2",
+                       bd=0, padx=0, pady=0)
+        lbl.pack(side="left")
+
+        def toggle(_e=None, n=name, st=state, bx=box):
+            new = not st["on"]
+            err = self._set_show_source(n, new)
+            if err:
+                return
+            st["on"] = new
+            bx.config(text="☑" if new else "☐")
+
+        box.bind("<Button-1>", toggle)
+        lbl.bind("<Button-1>", toggle)
 
     def _show_error(self, msg: str) -> None:
         self._reset_body()
