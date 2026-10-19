@@ -1379,7 +1379,7 @@ class UsageWidget(tk.Tk):
             # with its hide-checkbox so the user can toggle visibility.
             visible = rows
         else:
-            if self._update_state == "available":
+            if self._update_state in ("available", "installing", "error"):
                 self._add_update_banner()
             elif self._deps_missing:
                 self._add_deps_banner()
@@ -1406,17 +1406,32 @@ class UsageWidget(tk.Tk):
         ).pack(anchor="w", pady=(0, 2))
 
     def _add_update_banner(self) -> None:
+        s = self._update_state
+        if s == "installing":
+            text, clickable, action = "Downloading update… please wait", False, None
+        elif s == "error":
+            text, clickable, action = "Update failed — Click to retry", True, self._on_install_update
+        else:
+            text, clickable, action = "Download Update", True, self._on_install_update
+
         btn = tk.Label(
-            self._body, text="Download Update",
-            bg=BTN_BG, fg="white",
+            self._body, text=text,
+            bg=BTN_BG, fg=FG_DIM if not clickable else "white",
             font=("Segoe UI", 8, "bold"),
-            cursor="hand2", pady=4,
-            bd=0, padx=0,
+            cursor="arrow" if not clickable else "hand2",
+            pady=4, bd=0, padx=0,
         )
         btn.pack(fill="x", pady=(0, 6))
-        btn.bind("<Button-1>", lambda _e: self._on_install_update())
-        btn.bind("<Enter>",   lambda _e: btn.config(bg=BTN_BG_HOVER))
-        btn.bind("<Leave>",   lambda _e: btn.config(bg=BTN_BG))
+        if clickable and action is not None:
+            btn.bind("<Button-1>", lambda _e: action())
+            btn.bind("<Enter>",   lambda _e: btn.config(bg=BTN_BG_HOVER))
+            btn.bind("<Leave>",   lambda _e: btn.config(bg=BTN_BG))
+
+        if s == "error" and self._update_detail:
+            tk.Label(self._body, text=self._update_detail,
+                     bg=BG, fg=BAR_HIGH, font=("Segoe UI", 7),
+                     wraplength=self._inner_w(), justify="left",
+                     bd=0, padx=0, pady=0).pack(anchor="w", pady=(0, 4))
 
     @staticmethod
     def _has_tray_deps() -> bool:
@@ -1778,8 +1793,11 @@ class UsageWidget(tk.Tk):
         state, detail = self._update_state, self._update_detail
 
         # Button: label and action change based on state. Always present.
-        if state in ("checking", "installing"):
-            label  = "Checking…" if state == "checking" else "Installing…"
+        if state == "checking":
+            label  = "Checking… please wait"
+            action = None
+        elif state == "installing":
+            label  = "Downloading update… please wait"
             action = None
         elif state == "available":
             label  = "Download Update"
@@ -1814,6 +1832,8 @@ class UsageWidget(tk.Tk):
         self._update_state  = state
         self._update_detail = detail
         self._render_update_section()
+        if not self._manage_mode:
+            self._render(self._last_rows)
 
     def _auto_check_for_update(self) -> None:
         """Background update check fired once at startup; silent unless an update is found."""
@@ -1834,6 +1854,8 @@ class UsageWidget(tk.Tk):
         self._after_safe(0, apply)
 
     def _on_check_update(self) -> None:
+        if self._update_state in ("checking", "installing"):
+            return
         self._set_update_state("checking")
         threading.Thread(target=self._do_check_update, daemon=True).start()
 
@@ -1842,6 +1864,8 @@ class UsageWidget(tk.Tk):
         self._after_safe(0, self._set_update_state, status, detail)
 
     def _on_install_update(self) -> None:
+        if self._update_state in ("checking", "installing"):
+            return
         self._set_update_state("installing")
         threading.Thread(target=self._do_install_update, daemon=True).start()
 
