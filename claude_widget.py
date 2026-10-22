@@ -11,6 +11,7 @@ import base64
 import ctypes
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,8 @@ from requests.exceptions import HTTPError
 # ── Paths ────────────────────────────────────────────────────────────────────
 
 HOME          = Path.home()
-CREDS_FILE    = HOME / ".claude" / ".credentials.json"
+CLAUDE_DIR    = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
+CREDS_FILE    = CLAUDE_DIR / ".credentials.json"
 GROK_AUTH     = HOME / ".grok" / "auth.json"
 SETTINGS_FILE = HOME / ".claude_widget_settings.json"
 REPO_DIR      = Path(__file__).resolve().parent
@@ -225,6 +227,22 @@ def chatgpt_connected() -> bool:
     return bool(data.get("accessToken") or data.get("access_token"))
 
 
+CREDS_WATCH_S = 10 * 60
+
+
+def open_claude_login() -> bool:
+    """Open Claude Code in a new console so the user can log in. False if it isn't installed."""
+    exe = shutil.which("claude")
+    if not exe:
+        return False
+    try:
+        subprocess.Popen([exe], cwd=str(HOME),
+                         creationflags=subprocess.CREATE_NEW_CONSOLE)
+    except OSError:
+        return False
+    return True
+
+
 def source_has_creds(name: str) -> bool:
     if name == "claude":
         return claude_connected()
@@ -236,13 +254,13 @@ def source_has_creds(name: str) -> bool:
 
 
 LOGIN_URLS = {
-    "claude":  "https://claude.ai/login",
+    "claude":  "https://claude.com/product/claude-code",
     "grok":    "https://grok.com",
     "chatgpt": "https://chatgpt.com",
 }
 
 LOGIN_HINTS = {
-    "claude":  "Run 'claude' in a terminal\nto refresh credentials.",
+    "claude":  "Reads your Claude Code login,\nnot the claude.ai website.\nSign in opens Claude Code in a\nterminal; run /login there.",
     "grok":    "Run 'grok login' in a terminal\nto refresh credentials.",
     "chatgpt": "Sign in on chatgpt.com.\nUsage meters for ChatGPT\nare not wired up yet.",
 }
@@ -1332,14 +1350,27 @@ class UsageWidget(tk.Tk):
         except OSError:
             pass
         if not source_has_creds(name):
-            url = LOGIN_URLS.get(name)
-            if url:
-                webbrowser.open(url)
+            if name == "claude" and open_claude_login():
+                self._watch_for_creds(name, time.time() + CREDS_WATCH_S)
+            else:
+                url = LOGIN_URLS.get(name)
+                if url:
+                    webbrowser.open(url)
         self._refresh_account_rows()
         if self._show_source(name):
             self._source = name
         self._show_active()
         self._manual_refresh()
+
+    def _watch_for_creds(self, name: str, deadline: float) -> None:
+        """Refresh as soon as the terminal login writes credentials."""
+        if self._destroyed or time.time() > deadline:
+            return
+        if source_has_creds(name):
+            self._refresh_account_rows()
+            self._manual_refresh()
+            return
+        self._after_safe(2000, self._watch_for_creds, name, deadline)
 
     def _sign_out(self, name: str) -> None:
         gone = self._signed_out_set()

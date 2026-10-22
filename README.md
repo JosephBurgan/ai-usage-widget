@@ -33,7 +33,11 @@ The setup script installs the Python dependency, creates Start Menu and Startup
 shortcuts (with the widget icon), and launches the widget.
 
 Make sure you've run `claude` at least once and logged in — the widget needs the
-credentials file that Claude Code creates at `%USERPROFILE%\.claude\.credentials.json`.
+credentials file that Claude Code creates at `%USERPROFILE%\.claude\.credentials.json`
+(or under `CLAUDE_CONFIG_DIR` if you set it). Being signed in on claude.ai in a browser
+or the Claude desktop app is not enough. If the Claude tab says "Not signed in", click
+**Sign in**: it opens Claude Code in a terminal; run `/login` there and the widget
+picks up the new login on its own.
 
 ## Update
 
