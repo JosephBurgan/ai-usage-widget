@@ -1289,10 +1289,12 @@ def render_tray_icon(util: float, style: str, segments: int = 5,
             # Reset countdown runs along the bottom, under the usage bars.
             th = round(n * TRAY_TIME_H)
             ty = n - th
-            d.rectangle((0, ty, n - 1, n - 1), fill=BAR_BG)
+            d.rounded_rectangle((0, ty, n - 1, n - 1), radius=r, fill=BAR_BG,
+                                corners=(False, False, True, True))
             tp = min(max(time_progress, 0.0), 1.0)
             if tp > 0:
-                d.rectangle((0, ty, round((n - 1) * tp), n - 1), fill=TIME_BAR_FG)
+                d.rounded_rectangle((0, ty, round((n - 1) * tp), n - 1), radius=r,
+                                    fill=TIME_BAR_FG, corners=(False, False, tp >= 1, True))
             bottom = ty - 1
         # Square bottoms when the bars sit on the reset bar.
         corners = (True, True, time_progress is None, time_progress is None)
