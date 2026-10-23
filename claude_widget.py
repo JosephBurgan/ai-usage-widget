@@ -1060,7 +1060,7 @@ def _draw_number_with_sign(draw, n: int, text: str, sizing: str, fill: str) -> N
 # their owner), parked just left of the tray. Anything unexpected and it hides.
 
 READOUT_POLL_MS  = 2000
-READOUT_GAP      = 6
+READOUT_GAP      = 0
 GWLP_HWNDPARENT  = -8
 HWND_TOPMOST     = -1
 SWP_NOACTIVATE   = 0x0010
@@ -1113,25 +1113,50 @@ def _is_light(hex_color: str) -> bool:
     return 0.299 * r + 0.587 * g + 0.114 * b > 140
 
 
-READOUT_PAD = 4
+READOUT_SUB_PX   = 10
+READOUT_TEXT_GAP = 1
+READOUT_STYLES   = (("ring", "Ring"), ("bars", "Bars"))
+READOUT_BARS_PAD    = 4     # px margin on every side of the bars readout
+READOUT_BARS_SPACE  = 2     # px between neighbouring vertical bars
+READOUT_BARS_GAP    = 1     # px between the vertical bars and their reset bar
+READOUT_MARKER_W    = 1     # px line where each fill ends
+READOUT_STACK_GAP   = 3     # px between the 5-hour and 7-day stacks
+READOUT_STACK_TIME_H = 2    # px, reset bar height when stacked
+READOUT_STACK       = ("5-hour", "7-day")
+READOUT_BAR_METERS  = (("5-hour", "5-hour"), ("7-day", "7-day"), ("both", "Both"))
+
+
+def _readout_bars_inner_w(segment_counts: list[int], h: int) -> int:
+    """Width near the content height where every stack's bars come out whole and equal."""
+    target = max(8, h - 2 * READOUT_BARS_PAD)
+    gap = READOUT_BARS_SPACE
+    for delta in sorted(range(-6, 13), key=lambda d: (abs(d), d < 0)):
+        w = target + delta
+        if all((w - gap * (n - 1)) % n == 0 and w > gap * (n - 1) for n in segment_counts):
+            return w
+    return target
+
+
+def readout_bars_width(segment_counts: list[int], h: int) -> int:
+    return _readout_bars_inner_w(segment_counts, h) + 2 * READOUT_BARS_PAD
 
 
 def _readout_sub(label: str, sub: str) -> str:
     return sub.removeprefix("resets in ") if sub else label
 
 
+def _readout_ring(h: int) -> int:
+    return max(12, h - READOUT_SUB_PX - READOUT_TEXT_GAP - 4)
+
+
 def readout_width(util: float, label: str, sub: str, h: int) -> int:
-    """Just wide enough for ring + text, so it hugs the tray."""
+    """Just wide enough for the ring or the text under it, so it hugs the tray."""
     from PIL import Image, ImageDraw
 
     s = TRAY_SS
     d = ImageDraw.Draw(Image.new("RGB", (1, 1)))
-    pct = min(int(util * 100), 100)
-    big_w = (d.textlength("100" if pct == 100 else "88", font=_tray_font(15 * s)) + s
-             + d.textlength("%", font=_tray_font(int(15 * s * TRAY_SIGN_SCALE))))
-    sub_w = d.textlength(_readout_sub(label, sub), font=_tray_font(10 * s))
-    ring = int(h * 0.62)
-    return READOUT_PAD + ring + 7 + int(max(big_w, sub_w) / s + 0.99) + READOUT_PAD
+    sub_w = d.textlength(_readout_sub(label, sub), font=_tray_font(READOUT_SUB_PX * s))
+    return max(_readout_ring(h), int(sub_w / s + 0.99))
 
 
 def render_readout(util: float, label: str, sub: str, w: int, h: int, bg: str):
@@ -1146,26 +1171,50 @@ def render_readout(util: float, label: str, sub: str, w: int, h: int, bg: str):
     text_fg = "#1a1a1a" if _is_light(bg) else FG
     dim_fg = "#5a5a5a" if _is_light(bg) else FG_DIM
 
-    ring = int(h * 0.62) * s
-    stroke = max(2, ring * 18 // 100)
-    top = (h * s - ring) // 2
-    box = (READOUT_PAD * s, top, READOUT_PAD * s + ring, top + ring)
+    # Ring with the number in its hole, reset countdown centered under it.
+    ring = _readout_ring(h) * s
+    stroke = max(2, ring * 14 // 100)
+    small = _tray_font(READOUT_SUB_PX * s)
+    text = _readout_sub(label, sub)
+    _, st, _, sb = d.textbbox((0, 0), text, font=small, anchor="lt")
+    top = (h * s - (ring + READOUT_TEXT_GAP * s + sb - st)) // 2
+    left = (w * s - ring) // 2
+    box = (left, top, left + ring, top + ring)
     d.ellipse(box, outline=track, width=stroke)
     if util > 0:
         d.arc(box, -90, -90 + 360 * util, fill=color, width=stroke)
 
-    tx = box[2] + 7 * s
-    big, small = _tray_font(15 * s), _tray_font(10 * s)
-    base = h * s // 2 + 1 * s
-    digits = str(min(int(util * 100), 100))
-    d.text((tx, base), digits, fill=color, font=big, anchor="ls")
-    # Small raised %, same as the tray icon.
-    dl, dt, dr, _ = d.textbbox((tx, base), digits, font=big, anchor="ls")
-    sign = _tray_font(int(15 * s * TRAY_SIGN_SCALE))
-    sl, st, _, _ = d.textbbox((0, 0), "%", font=sign, anchor="ls")
-    d.text((dr + s - sl, dt - st), "%", fill=color, font=sign, anchor="ls")
-    d.text((tx, h * s // 2 + 3 * s), _readout_sub(label, sub), fill=dim_fg,
-           font=small, anchor="lt")
+    pct = min(int(util * 100), 100)
+    hole = ring - 2 * stroke
+    big = _fit_tray_text(d, "100" if pct == 100 else "88", int(hole * 0.86), hole)
+    digits = str(pct)
+    l, t, r, b = d.textbbox((0, 0), digits, font=big, anchor="lt")
+    cx, cy = left + ring / 2, top + ring / 2
+    d.text((cx - (r - l) / 2 - l, cy - (b - t) / 2 - t), digits, fill=color,
+           font=big, anchor="lt")
+    d.text((w * s / 2, top + ring + READOUT_TEXT_GAP * s - st), text, fill=dim_fg,
+           font=small, anchor="mt")
+    return img.resize((w, h), Image.LANCZOS)
+
+
+def render_readout_bars(rows: list[Row], w: int, h: int, bg: str):
+    """Split bars per row, stacked top to bottom, as tall as the taskbar allows."""
+    from PIL import Image, ImageDraw
+
+    s, pad = TRAY_SS, READOUT_BARS_PAD
+    img = Image.new("RGB", (w * s, h * s), bg)
+    d = ImageDraw.Draw(img)
+    stacked = len(rows) > 1
+    ch = h - 2 * pad
+    gaps = READOUT_STACK_GAP * (len(rows) - 1)
+    sh = (ch - gaps) // len(rows)
+    y = pad + (ch - gaps - sh * len(rows)) // 2
+    for row in rows:
+        _draw_split_bars(d, pad, y, w - 2 * pad, sh, row[1], tray_segments(row), row[3],
+                         gap=READOUT_BARS_SPACE,
+                         time_h=READOUT_STACK_TIME_H if stacked else None,
+                         time_gap=READOUT_BARS_GAP, marker=READOUT_MARKER_W)
+        y += sh + READOUT_STACK_GAP
     return img.resize((w, h), Image.LANCZOS)
 
 
@@ -1228,16 +1277,28 @@ class TaskbarReadout:
         u32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)
         return True
 
-    def show(self, util: float, label: str, sub: str) -> None:
+    def show(self, rows: list[Row], style: str) -> None:
+        """Ring shows rows[0]; bars stack every row."""
+        label, util, sub = rows[0][0], rows[0][1], rows[0][2]
+        bars = style == "bars"
         try:
-            if not self._ensure(lambda h: readout_width(util, label, sub, h)):
+            counts = [tray_segments(r) for r in rows]
+            width_for = (lambda h: readout_bars_width(counts, h)) if bars else (
+                lambda h: readout_width(util, label, sub, h))
+            if not self._ensure(width_for):
                 return
-            data = (round(util, 3), label, sub, self._slot, self._bg)
+            data = (style, self._slot, self._bg, tuple(
+                (r[0], round(r[1], 3), r[2], c, None if r[3] is None else round(r[3], 3))
+                for r, c in zip(rows, counts)))
             if data == getattr(self, "_data_drawn", None):
                 return
             from PIL import ImageTk
             _, _, w, h = self._slot
-            self._photo = ImageTk.PhotoImage(render_readout(util, label, sub, w, h, self._bg))
+            if bars:
+                image = render_readout_bars(rows, w, h, self._bg)
+            else:
+                image = render_readout(util, label, sub, w, h, self._bg)
+            self._photo = ImageTk.PhotoImage(image)
             self._lbl.config(image=self._photo, bg=self._bg)
             self._win.configure(bg=self._bg)
             # The sampled color becomes see-through, so the real taskbar (acrylic,
@@ -1267,6 +1328,74 @@ def tray_segments(row: Row) -> int:
     return 5
 
 
+def _split_bars_grid(w: int, segments: int, gap: int) -> tuple[int, int]:
+    """(bar width, total width) in px. Every bar gets the same whole width."""
+    bw = max(1, (w - gap * (segments - 1)) // segments)
+    return bw, bw * segments + gap * (segments - 1)
+
+
+def _tint(hex_color: str, amount: float) -> str:
+    """Blend toward white by amount (0..1)."""
+    rgb = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return "#" + "".join(f"{round(c + (255 - c) * amount):02x}" for c in rgb)
+
+
+def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: int,
+                     time_progress: float | None, gap: int | None = None,
+                     time_h: int | None = None, time_gap: int = 0, marker: int = 0) -> None:
+    """Split bars in a w×h px box at (x, y) on a TRAY_SS-supersampled canvas.
+
+    Fills left to right; the bar in progress fills bottom-up. Edges sit on whole
+    output pixels so small sizes stay crisp. time_gap is px between the bars and
+    the reset bar. marker is the px thickness of a line where each fill ends:
+    white on the reset bar, a light tint of the usage color on the bars.
+    """
+    s = TRAY_SS
+    util = min(max(util, 0.0), 1.0)
+    color = bar_color(util)
+    if gap is None:
+        gap = max(1, round(h * TRAY_BAR_GAP))
+    bw, gw = _split_bars_grid(w, segments, gap)
+    x += (w - gw) // 2
+    r = int(bw * s * 0.25)
+    bars_h = h
+    sits = time_progress is not None and time_gap == 0
+    if time_progress is not None:
+        # Reset countdown runs along the bottom, under the usage bars.
+        th = time_h or max(1, round(h * TRAY_TIME_H))
+        ty, bottom = (y + h - th) * s, (y + h) * s - 1
+        # Pillow needs radius <= (span - 3) / 2 when two corners share a side.
+        tr = max(0, min(r, (th * s - 3) // 2))
+        d.rounded_rectangle((x * s, ty, (x + gw) * s - 1, bottom), radius=tr, fill=BAR_BG,
+                            corners=(not sits, not sits, True, True))
+        tp = min(max(time_progress, 0.0), 1.0)
+        end = round(gw * tp)
+        if end > 0:
+            d.rounded_rectangle((x * s, ty, (x + end) * s - 1, bottom),
+                                radius=max(0, min(tr, (end * s - 3) // 2)), fill=TIME_BAR_FG,
+                                corners=(not sits, not sits and tp >= 1, tp >= 1, True))
+        if marker:
+            mx = x + min(max(end - marker, 0), gw - marker)
+            d.rectangle((mx * s, ty, (mx + marker) * s - 1, bottom), fill="#ffffff")
+        bars_h = h - th - time_gap
+    top, bottom = y * s, (y + bars_h) * s - 1
+    # Square bottoms when the bars sit on the reset bar.
+    corners = (True, True, not sits, not sits)
+    filled = util * segments
+    for i in range(segments):
+        x0 = (x + i * (bw + gap)) * s
+        x1 = x0 + bw * s - 1
+        d.rounded_rectangle((x0, top, x1, bottom), radius=r, fill=BAR_BG, corners=corners)
+        part = min(max(filled - i, 0.0), 1.0)
+        fill_h = round(bars_h * part)
+        if fill_h > 0:
+            y0 = (y + bars_h - fill_h) * s
+            d.rounded_rectangle((x0, y0, x1, bottom), radius=max(0, min(r, (bottom - y0 - 2) // 2)),
+                                fill=color, corners=corners)
+            if marker and part < 1:
+                d.rectangle((x0, y0, x1, y0 + marker * s - 1), fill=_tint(color, 0.55))
+
+
 def render_tray_icon(util: float, style: str, segments: int = 5,
                      time_progress: float | None = None):
     """Usage as a number, a ring, both, or split bars, colored like the bars."""
@@ -1280,34 +1409,7 @@ def render_tray_icon(util: float, style: str, segments: int = 5,
     room = n
 
     if style == "bars":
-        # Fills left to right; the bar in progress fills bottom-up.
-        gap = n * TRAY_BAR_GAP
-        w = (n - gap * (segments - 1)) / segments
-        r = int(w * 0.25)
-        bottom = n - 1
-        if time_progress is not None:
-            # Reset countdown runs along the bottom, under the usage bars.
-            th = round(n * TRAY_TIME_H)
-            ty = n - th
-            d.rounded_rectangle((0, ty, n - 1, n - 1), radius=r, fill=BAR_BG,
-                                corners=(False, False, True, True))
-            tp = min(max(time_progress, 0.0), 1.0)
-            if tp > 0:
-                d.rounded_rectangle((0, ty, round((n - 1) * tp), n - 1), radius=r,
-                                    fill=TIME_BAR_FG, corners=(False, False, tp >= 1, True))
-            bottom = ty - 1
-        # Square bottoms when the bars sit on the reset bar.
-        corners = (True, True, time_progress is None, time_progress is None)
-        filled = util * segments
-        for i in range(segments):
-            x0 = round(i * (w + gap))
-            x1 = round(x0 + w) - 1
-            d.rounded_rectangle((x0, 0, x1, bottom), radius=r, fill=BAR_BG, corners=corners)
-            part = min(max(filled - i, 0.0), 1.0)
-            if part > 0:
-                top = round(bottom * (1 - part))
-                d.rounded_rectangle((x0, top, x1, bottom), radius=min(r, (bottom - top) // 2),
-                                    fill=color, corners=corners)
+        _draw_split_bars(d, 0, 0, TRAY_PX, TRAY_PX, util, segments, time_progress)
 
     if style in ("ring", "both"):
         w = n * (22 if style == "ring" else 14) // 100
@@ -1627,6 +1729,14 @@ class UsageWidget(tk.Tk):
     def _readout_on(self) -> bool:
         return bool(self._settings.get("taskbar_readout", False))
 
+    def _readout_style(self) -> str:
+        style = self._settings.get("readout_style")
+        return style if style in dict(READOUT_STYLES) else "ring"
+
+    def _readout_bar_meters(self) -> str:
+        meters = self._settings.get("readout_bar_meters")
+        return meters if meters in dict(READOUT_BAR_METERS) else "both"
+
     def _picker_on(self) -> bool:
         return self._tray is not None and (self._tray_dynamic() or self._readout_on())
 
@@ -1635,7 +1745,16 @@ class UsageWidget(tk.Tk):
         if row is None:
             self._readout.hide()
             return
-        self._readout.show(row[1], row[0], row[2])
+        style = self._readout_style()
+        rows = [row]
+        if style == "bars":
+            panel = self._panels.get(self._tray_meter()[0])
+            by_label = {r[0]: r for r in panel[1]} if panel and panel[0] == "ok" else {}
+            meters = self._readout_bar_meters()
+            labels = READOUT_STACK if meters == "both" else (meters,)
+            if all(label in by_label for label in labels):
+                rows = [by_label[label] for label in labels]
+        self._readout.show(rows, style)
 
     def _readout_tick(self) -> None:
         if self._destroyed:
@@ -2119,6 +2238,9 @@ class UsageWidget(tk.Tk):
                 get_state=self._readout_on,
                 set_state=lambda on: self._set_tray_setting("taskbar_readout", bool(on)),
             )
+            self._readout_style_frame = tk.Frame(opts, bg=BG)
+            self._readout_style_frame.pack(fill="x", pady=(4, 0))
+            self._render_readout_styles()
             tk.Label(opts, text="Pick the meter with ○ next to a bar.",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 7),
                      bd=0, padx=0, pady=0).pack(anchor="w", pady=(3, 0))
@@ -2130,11 +2252,27 @@ class UsageWidget(tk.Tk):
                  font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(anchor="w")
 
     def _render_tray_styles(self) -> None:
-        frame = self._tray_style_frame
+        self._render_style_buttons(self._tray_style_frame, TRAY_STYLES,
+                                   self._tray_style(), self._pick_tray_style)
+
+    def _render_readout_styles(self) -> None:
+        frame = self._readout_style_frame
         for child in frame.winfo_children():
             child.destroy()
-        current = self._tray_style()
-        for key, title in TRAY_STYLES:
+        styles = tk.Frame(frame, bg=BG)
+        styles.pack(fill="x")
+        self._render_style_buttons(styles, READOUT_STYLES,
+                                   self._readout_style(), self._pick_readout_style)
+        if self._readout_style() == "bars":
+            meters = tk.Frame(frame, bg=BG)
+            meters.pack(fill="x", pady=(4, 0))
+            self._render_style_buttons(meters, READOUT_BAR_METERS,
+                                       self._readout_bar_meters(), self._pick_readout_bar_meters)
+
+    def _render_style_buttons(self, frame: tk.Frame, styles, current: str, pick) -> None:
+        for child in frame.winfo_children():
+            child.destroy()
+        for key, title in styles:
             active = key == current
             btn = tk.Label(
                 frame, text=title, bg=BTN_BG if active else BG,
@@ -2145,11 +2283,19 @@ class UsageWidget(tk.Tk):
                 cursor="hand2", bd=0, padx=6, pady=1,
             )
             btn.pack(side="left", padx=(0, 4))
-            btn.bind("<Button-1>", lambda _e, k=key: self._pick_tray_style(k))
+            btn.bind("<Button-1>", lambda _e, k=key: pick(k))
 
     def _pick_tray_style(self, key: str) -> None:
         self._set_tray_setting("tray_style", key)
         self._render_tray_styles()
+
+    def _pick_readout_style(self, key: str) -> None:
+        self._set_tray_setting("readout_style", key)
+        self._render_readout_styles()
+
+    def _pick_readout_bar_meters(self, key: str) -> None:
+        self._set_tray_setting("readout_bar_meters", key)
+        self._render_readout_styles()
 
     def _set_minimize_on_close(self, enabled: bool) -> str | None:
         self._settings["minimize_on_close"] = bool(enabled)
