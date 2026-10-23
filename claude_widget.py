@@ -977,6 +977,210 @@ def _draw_number_with_sign(draw, n: int, text: str, sizing: str, fill: str) -> N
               fill=fill, font=small, anchor="ls")
 
 
+# ── Taskbar readout (experimental) ───────────────────────────────────────────
+# Windows 11 has no API for putting UI on the taskbar. A child window of
+# Shell_TrayWnd is drawn under the taskbar's XAML layer, so instead this is a
+# borderless window owned by the taskbar (owned windows always stack above
+# their owner), parked just left of the tray. Anything unexpected and it hides.
+
+READOUT_POLL_MS  = 2000
+READOUT_GAP      = 6
+GWLP_HWNDPARENT  = -8
+HWND_TOPMOST     = -1
+SWP_NOACTIVATE   = 0x0010
+SWP_SHOWWINDOW   = 0x0040
+
+
+def _win_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    r = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(wintypes.HWND(hwnd), ctypes.byref(r)):
+        return None
+    return r.left, r.top, r.right, r.bottom
+
+
+def _taskbar_slot(width: int) -> tuple[int, tuple[int, int, int, int]] | None:
+    """(taskbar hwnd, screen x/y/w/h) for a box left of the tray, or None."""
+    u32 = ctypes.windll.user32
+    u32.FindWindowW.restype = wintypes.HWND
+    u32.FindWindowExW.restype = wintypes.HWND
+    bar = u32.FindWindowW("Shell_TrayWnd", None)
+    if not bar:
+        return None
+    notify = u32.FindWindowExW(bar, None, "TrayNotifyWnd", None)
+    bar_r, notify_r = _win_rect(bar), _win_rect(notify) if notify else None
+    if not bar_r or not notify_r:
+        return None
+    bl, bt, br, bb = bar_r
+    if br - bl < bb - bt:          # vertical taskbar: no room, skip
+        return None
+    x = notify_r[0] - width - READOUT_GAP
+    if x < bl:
+        return None
+    return bar, (x, bt, width, bb - bt)
+
+
+def _taskbar_bg(x: int, y: int) -> str:
+    """Sample the taskbar just left of the slot so the readout blends in."""
+    u32, g32 = ctypes.windll.user32, ctypes.windll.gdi32
+    hdc = u32.GetDC(None)
+    try:
+        c = g32.GetPixel(hdc, max(0, x - 3), y + 2)
+    finally:
+        u32.ReleaseDC(None, hdc)
+    if c == -1 or c == 0xFFFFFFFF:
+        return "#1c1c1c"
+    return f"#{c & 0xFF:02x}{(c >> 8) & 0xFF:02x}{(c >> 16) & 0xFF:02x}"
+
+
+def _is_light(hex_color: str) -> bool:
+    r, g, b = (int(hex_color[i:i + 2], 16) for i in (1, 3, 5))
+    return 0.299 * r + 0.587 * g + 0.114 * b > 140
+
+
+READOUT_PAD = 4
+
+
+def _readout_sub(label: str, sub: str) -> str:
+    return sub.removeprefix("resets in ") if sub else label
+
+
+def readout_width(util: float, label: str, sub: str, h: int) -> int:
+    """Just wide enough for ring + text, so it hugs the tray."""
+    from PIL import Image, ImageDraw
+
+    s = TRAY_SS
+    d = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    pct = min(int(util * 100), 100)
+    big_w = (d.textlength("100" if pct == 100 else "88", font=_tray_font(15 * s)) + s
+             + d.textlength("%", font=_tray_font(int(15 * s * TRAY_SIGN_SCALE))))
+    sub_w = d.textlength(_readout_sub(label, sub), font=_tray_font(10 * s))
+    ring = int(h * 0.62)
+    return READOUT_PAD + ring + 7 + int(max(big_w, sub_w) / s + 0.99) + READOUT_PAD
+
+
+def render_readout(util: float, label: str, sub: str, w: int, h: int, bg: str):
+    from PIL import Image, ImageDraw
+
+    s = TRAY_SS
+    img = Image.new("RGB", (w * s, h * s), bg)
+    d = ImageDraw.Draw(img)
+    util = min(max(util, 0.0), 1.0)
+    color = bar_color(util)
+    track = "#c8c8c8" if _is_light(bg) else BAR_BG
+    text_fg = "#1a1a1a" if _is_light(bg) else FG
+    dim_fg = "#5a5a5a" if _is_light(bg) else FG_DIM
+
+    ring = int(h * 0.62) * s
+    stroke = max(2, ring * 18 // 100)
+    top = (h * s - ring) // 2
+    box = (READOUT_PAD * s, top, READOUT_PAD * s + ring, top + ring)
+    d.ellipse(box, outline=track, width=stroke)
+    if util > 0:
+        d.arc(box, -90, -90 + 360 * util, fill=color, width=stroke)
+
+    tx = box[2] + 7 * s
+    big, small = _tray_font(15 * s), _tray_font(10 * s)
+    base = h * s // 2 + 1 * s
+    digits = str(min(int(util * 100), 100))
+    d.text((tx, base), digits, fill=color, font=big, anchor="ls")
+    # Small raised %, same as the tray icon.
+    dl, dt, dr, _ = d.textbbox((tx, base), digits, font=big, anchor="ls")
+    sign = _tray_font(int(15 * s * TRAY_SIGN_SCALE))
+    sl, st, _, _ = d.textbbox((0, 0), "%", font=sign, anchor="ls")
+    d.text((dr + s - sl, dt - st), "%", fill=color, font=sign, anchor="ls")
+    d.text((tx, h * s // 2 + 3 * s), _readout_sub(label, sub), fill=dim_fg,
+           font=small, anchor="lt")
+    return img.resize((w, h), Image.LANCZOS)
+
+
+class TaskbarReadout:
+    """Owns the reparented window. All calls come from the Tk thread."""
+
+    def __init__(self, root: tk.Tk, on_click) -> None:
+        self._root = root
+        self._win: tk.Toplevel | None = None
+        self._lbl: tk.Label | None = None
+        self._photo = None
+        self._bar = 0
+        self._slot: tuple[int, int, int, int] | None = None
+        self._bg = "#1c1c1c"
+        self._data: tuple | None = None
+        self._on_click = on_click
+
+    def _hwnd(self) -> int:
+        return ctypes.windll.user32.GetParent(self._win.winfo_id())
+
+    def _ensure(self, width_for) -> bool:
+        found = _taskbar_slot(0)
+        if not found:
+            self.hide()
+            return False
+        bar, (right, y, _, h) = found
+        w = width_for(h)
+        if right - w < 0:
+            self.hide()
+            return False
+        slot = (right - w, y, w, h)
+        if self._win is None or not self._win.winfo_exists():
+            self._win = tk.Toplevel(self._root)
+            self._win.overrideredirect(True)
+            self._win.configure(bg=self._bg)
+            self._lbl = tk.Label(self._win, bd=0, bg=self._bg, cursor="hand2")
+            self._lbl.bind("<Button-1>", lambda _e: self._on_click())
+            self._win.update_idletasks()
+            self._bar = 0
+        hwnd = self._hwnd()
+        u32 = ctypes.windll.user32
+        if self._bar != bar:
+            # Owned by the taskbar, so Windows keeps it stacked above the taskbar.
+            u32.SetWindowLongPtrW.argtypes = (wintypes.HWND, ctypes.c_int, ctypes.c_ssize_t)
+            u32.SetWindowLongPtrW(hwnd, GWLP_HWNDPARENT, bar)
+            self._bar = bar
+        if slot != self._slot:
+            x, y, w, h = slot
+            self._bg = _taskbar_bg(x, y)
+            self._win.geometry(f"{w}x{h}+{x}+{y}")
+            self._lbl.place(x=0, y=0, width=w, height=h)
+            self._win.update_idletasks()
+            self._slot = slot
+            self._data_drawn = None
+        # Tk doesn't always move a reowned window, and clicking the taskbar can
+        # raise it over us, so pin the spot and z-order every poll.
+        x, y, w, h = self._slot
+        u32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
+                                     ctypes.c_int, ctypes.c_int, wintypes.UINT)
+        u32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)
+        return True
+
+    def show(self, util: float, label: str, sub: str) -> None:
+        try:
+            if not self._ensure(lambda h: readout_width(util, label, sub, h)):
+                return
+            data = (round(util, 3), label, sub, self._slot, self._bg)
+            if data == getattr(self, "_data_drawn", None):
+                return
+            from PIL import ImageTk
+            _, _, w, h = self._slot
+            self._photo = ImageTk.PhotoImage(render_readout(util, label, sub, w, h, self._bg))
+            self._lbl.config(image=self._photo, bg=self._bg)
+            self._win.configure(bg=self._bg)
+            # The sampled color becomes see-through, so the real taskbar (acrylic,
+            # top highlight) shows; edges stay anti-aliased against that color.
+            self._win.attributes("-transparentcolor", self._bg)
+            self._data_drawn = data
+        except Exception:  # noqa: BLE001 — experimental; never take the widget down
+            self.hide()
+
+    def hide(self) -> None:
+        win, self._win = self._win, None
+        self._bar, self._slot, self._data_drawn = 0, None, None
+        if win is not None:
+            try:
+                win.destroy()
+            except tk.TclError:
+                pass
+
+
 def render_tray_icon(util: float, style: str):
     """Usage as a number, a ring, or both, colored like the bars."""
     from PIL import Image, ImageDraw
@@ -1068,6 +1272,8 @@ class UsageWidget(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._setup_tray()
+        self._readout = TaskbarReadout(self, self._show_and_raise)
+        self._readout_tick()
         self._schedule_refresh()
 
         # Auto-check for updates a few seconds after startup so we don't
@@ -1182,6 +1388,7 @@ class UsageWidget(tk.Tk):
         self._save_position()
         self._destroyed = True
         self._close_settings_window()
+        self._readout.hide()
         if self._tray is not None:
             try:
                 self._tray.stop()
@@ -1268,17 +1475,41 @@ class UsageWidget(tk.Tk):
             return str(raw[0]), str(raw[1])
         return TRAY_DEFAULT_METER[0], TRAY_DEFAULT_METER[1]
 
-    def _tray_util(self) -> float | None:
+    def _tray_row(self) -> Row | None:
         source, label = self._tray_meter()
         panel = self._panels.get(source)
         if not panel or panel[0] != "ok":
             return None
         for row in panel[1]:
             if row[0] == label:
-                return row[1]
+                return row
         return None
 
+    def _tray_util(self) -> float | None:
+        row = self._tray_row()
+        return row[1] if row else None
+
+    def _readout_on(self) -> bool:
+        return bool(self._settings.get("taskbar_readout", False))
+
+    def _picker_on(self) -> bool:
+        return self._tray is not None and (self._tray_dynamic() or self._readout_on())
+
+    def _update_readout(self) -> None:
+        row = self._tray_row() if self._readout_on() else None
+        if row is None:
+            self._readout.hide()
+            return
+        self._readout.show(row[1], row[0], row[2])
+
+    def _readout_tick(self) -> None:
+        if self._destroyed:
+            return
+        self._update_readout()
+        self._after_safe(READOUT_POLL_MS, self._readout_tick)
+
     def _update_tray_icon(self) -> None:
+        self._update_readout()
         if self._tray is None:
             return
         util = self._tray_util() if self._tray_dynamic() else None
@@ -1747,6 +1978,11 @@ class UsageWidget(tk.Tk):
             self._tray_style_frame = tk.Frame(opts, bg=BG)
             self._tray_style_frame.pack(fill="x", pady=(4, 0))
             self._render_tray_styles()
+            self._make_checkbox(
+                opts, "Readout on taskbar (experimental)",
+                get_state=self._readout_on,
+                set_state=lambda on: self._set_tray_setting("taskbar_readout", bool(on)),
+            )
             tk.Label(opts, text="Pick the meter with ○ next to a bar.",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 7),
                      bd=0, padx=0, pady=0).pack(anchor="w", pady=(3, 0))
@@ -2102,6 +2338,7 @@ class UsageWidget(tk.Tk):
     def _do_relaunch(self) -> None:
         self._destroyed = True
         self._close_settings_window()
+        self._readout.hide()
         if self._tray is not None:
             try:
                 self._tray.stop()
@@ -2190,7 +2427,7 @@ class UsageWidget(tk.Tk):
                  font=("Segoe UI", 8, "bold"),
                  bd=0, padx=0, pady=0).pack(side="right")
 
-        if self._manage_mode and self._tray is not None and self._tray_dynamic():
+        if self._manage_mode and self._picker_on():
             picked = self._tray_meter() == (self._source, label)
             # Drawn, not a glyph: ○ and ● render at different sizes.
             dot = tk.Canvas(top, width=TRAY_DOT, height=TRAY_DOT, bg=BG,

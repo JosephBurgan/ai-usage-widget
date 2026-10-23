@@ -15,6 +15,10 @@ A small always-on-top floating window for Windows that shows your Claude.ai plan
 - Hidden-row preferences persist across restarts
 - Tray icon shows live usage as a number, a colored ring, or both. Pick the meter with
   the dot next to any bar in settings mode; turn it off under ≡ → Tray icon
+- Optional taskbar readout (experimental, off by default): a ring, the percentage and the
+  reset countdown on the taskbar just left of the tray. Turn it on under ≡ → Tray icon →
+  "Readout on taskbar". Windows has no official way to do this, so it may hide itself
+  after a Windows update; the tray icon keeps working either way
 
 ## Requirements
 
