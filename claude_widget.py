@@ -1379,7 +1379,7 @@ class UsageWidget(tk.Tk):
     def _on_close(self) -> None:
         """Close button. If the user opted in (and the tray is up), hide; else quit."""
         if self._tray is not None and self._settings.get("minimize_on_close", False):
-            self.withdraw()
+            self._hide_window()
         else:
             self._quit_app()
 
