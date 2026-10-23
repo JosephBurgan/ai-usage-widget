@@ -629,8 +629,46 @@ def set_startup_enabled(enabled: bool) -> str | None:
     return None
 
 
+_k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+_k32.CreateMutexW.restype = wintypes.HANDLE
+_k32.CreateEventW.restype = wintypes.HANDLE
+_k32.OpenEventW.restype = wintypes.HANDLE
+_k32.SetEvent.argtypes = (wintypes.HANDLE,)
+_k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+_k32.WaitForSingleObject.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+
+INSTANCE_MUTEX = "Local\\ai-usage-widget-instance"
+SHOW_EVENT     = "Local\\ai-usage-widget-show"
+SHOW_POLL_MS   = 300
+_instance_lock = None
+
+
+def claim_single_instance() -> bool:
+    """Take the one-widget lock. False means another widget already runs."""
+    global _instance_lock
+    _instance_lock = _k32.CreateMutexW(None, False, INSTANCE_MUTEX)
+    return ctypes.get_last_error() != 183   # ERROR_ALREADY_EXISTS
+
+
+def release_single_instance() -> None:
+    global _instance_lock
+    if _instance_lock:
+        _k32.CloseHandle(_instance_lock)
+        _instance_lock = None
+
+
+def signal_running_instance() -> None:
+    """Ask the widget that's already running to show itself."""
+    h = _k32.OpenEventW(0x0002, False, SHOW_EVENT)   # EVENT_MODIFY_STATE
+    if h:
+        _k32.SetEvent(h)
+        _k32.CloseHandle(h)
+
+
 def relaunch_widget() -> None:
     """Spawn a fresh widget process via the VBS launcher, then exit this one."""
+    # Free the lock first so the new process doesn't think we're still running.
+    release_single_instance()
     vbs = REPO_DIR / "claude_widget.vbs"
     if vbs.exists():
         subprocess.Popen(["wscript", str(vbs)], close_fds=True)
@@ -1315,6 +1353,8 @@ class UsageWidget(tk.Tk):
         self._setup_tray()
         self._readout = TaskbarReadout(self, self._show_and_raise)
         self._readout_tick()
+        self._show_event = _k32.CreateEventW(None, False, False, SHOW_EVENT)
+        self._show_event_tick()
         self._schedule_refresh()
 
         # Auto-check for updates a few seconds after startup so we don't
@@ -1452,6 +1492,12 @@ class UsageWidget(tk.Tk):
         self.attributes("-topmost", True)
         if not self._on_top:
             self.after(150, lambda: self.attributes("-topmost", False))
+
+    def _show_event_tick(self) -> None:
+        """A second launch signals this event instead of opening another widget."""
+        if self._show_event and _k32.WaitForSingleObject(self._show_event, 0) == 0:
+            self._show_and_raise()
+        self._after_safe(SHOW_POLL_MS, self._show_event_tick)
 
     def _hide_window(self) -> None:
         self._close_settings_window()
@@ -2621,6 +2667,9 @@ class UsageWidget(tk.Tk):
 
 
 def main() -> None:
+    if not claim_single_instance():
+        signal_running_instance()
+        return
     UsageWidget().mainloop()
 
 
