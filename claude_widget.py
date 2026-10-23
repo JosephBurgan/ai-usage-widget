@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import base64
 import ctypes
+import hashlib
 import json
 import os
 import shutil
@@ -663,6 +664,41 @@ def signal_running_instance() -> None:
     if h:
         _k32.SetEvent(h)
         _k32.CloseHandle(h)
+
+
+def icon_fingerprint() -> str:
+    try:
+        return hashlib.sha1((REPO_DIR / "claude_widget.ico").read_bytes()).hexdigest()
+    except OSError:
+        return ""
+
+
+def refresh_shell_icons() -> None:
+    """Make Explorer redraw our Start menu, taskbar and desktop shortcuts with the current .ico."""
+    icon = REPO_DIR / "claude_widget.ico"
+    ps = (
+        "$sh = New-Object -ComObject WScript.Shell;"
+        "$dirs = \"$env:APPDATA\\Microsoft\\Windows\\Start Menu\","
+        "\"$env:APPDATA\\Microsoft\\Internet Explorer\\Quick Launch\\User Pinned\\TaskBar\","
+        "\"$env:USERPROFILE\\Desktop\";"
+        "Get-ChildItem $dirs -Recurse -Filter *.lnk -ErrorAction SilentlyContinue | ForEach-Object {"
+        " $l = $sh.CreateShortcut($_.FullName);"
+        f" if ($l.IconLocation -like '{icon}*') {{ $l.Save(); $_.FullName }} }}"
+    )
+    no_window = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        r = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=20, creationflags=no_window,
+        )
+        notify = ctypes.windll.shell32.SHChangeNotify
+        for path in r.stdout.splitlines():
+            if path.strip():
+                notify(0x00002000, 0x0005, ctypes.c_wchar_p(path.strip()), None)  # UPDATEITEM, PATHW
+        notify(0x08000000, 0, None, None)                                          # ASSOCCHANGED
+        subprocess.run(["ie4uinit.exe", "-show"], timeout=20, creationflags=no_window)
+    except (OSError, subprocess.SubprocessError):
+        pass
 
 
 def relaunch_widget() -> None:
@@ -1356,6 +1392,7 @@ class UsageWidget(tk.Tk):
         self._show_event = _k32.CreateEventW(None, False, False, SHOW_EVENT)
         self._show_event_tick()
         self._schedule_refresh()
+        self._refresh_icons_if_changed()
 
         # Auto-check for updates a few seconds after startup so we don't
         # delay first paint.
@@ -1492,6 +1529,15 @@ class UsageWidget(tk.Tk):
         self.attributes("-topmost", True)
         if not self._on_top:
             self.after(150, lambda: self.attributes("-topmost", False))
+
+    def _refresh_icons_if_changed(self) -> None:
+        """After an update ships a new .ico, Windows keeps showing the cached old one."""
+        fp = icon_fingerprint()
+        if not fp or fp == self._settings.get("icon_fingerprint"):
+            return
+        self._settings["icon_fingerprint"] = fp
+        save_settings(self._settings)
+        threading.Thread(target=refresh_shell_icons, daemon=True).start()
 
     def _show_event_tick(self) -> None:
         """A second launch signals this event instead of opening another widget."""

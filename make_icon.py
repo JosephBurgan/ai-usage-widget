@@ -1,7 +1,7 @@
 """Generate claude_widget.ico — the split-bars tray icon, frozen at half usage.
 
 Five vertical usage bars (two and a half filled) sit on a reset bar that is
-three-quarters along. Run once after editing; the .ico and .png are what the widget loads.
+80% along. Run once after editing; the .ico and .png are what the widget loads.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ TIME_COLOR = "#999999"   # widget TIME_BAR_FG
 
 SEGMENTS = 5
 USAGE    = 0.5
-RESET    = 0.75
+RESET    = 0.8
 GAP      = 0.06           # widget TRAY_BAR_GAP
 TIME_H   = 0.16           # widget TRAY_TIME_H
 
@@ -29,14 +29,17 @@ def draw_icon(size: int) -> Image.Image:
     img = Image.new("RGBA", (s, s), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
 
-    th = round(s * TIME_H)
-    ty = s - th
-    d.rectangle((0, ty, s - 1, s - 1), fill=TRACK)
-    d.rectangle((0, ty, round((s - 1) * RESET), s - 1), fill=TIME_COLOR)
-
     gap = s * GAP
     w = (s - gap * (SEGMENTS - 1)) / SEGMENTS
     r = int(w * 0.25)
+
+    th = round(s * TIME_H)
+    ty = s - th
+    d.rounded_rectangle((0, ty, s - 1, s - 1), radius=r, fill=TRACK,
+                        corners=(False, False, True, True))
+    d.rounded_rectangle((0, ty, round((s - 1) * RESET), s - 1), radius=r, fill=TIME_COLOR,
+                        corners=(False, False, False, True))
+
     bottom = ty - 1
     corners = (True, True, False, False)
     filled = USAGE * SEGMENTS
