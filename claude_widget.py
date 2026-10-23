@@ -919,6 +919,7 @@ TRAY_PX      = 64
 TRAY_SS      = 4            # supersample; PIL draws arcs without anti-aliasing
 TRAY_STYLES  = (("percent", "Number"), ("ring", "Ring"), ("both", "Both"), ("bars", "Bars"))
 TRAY_BAR_GAP = 0.06         # gap between bars, as a fraction of the icon
+TRAY_TIME_H  = 0.16         # reset bar under the split bars, as a fraction of the icon
 TRAY_DEFAULT_METER = ["claude", "5-hour"]
 TRAY_DOT     = 10           # px, meter-picker dot in settings mode
 
@@ -1192,7 +1193,8 @@ def tray_segments(row: Row) -> int:
     return 5
 
 
-def render_tray_icon(util: float, style: str, segments: int = 5):
+def render_tray_icon(util: float, style: str, segments: int = 5,
+                     time_progress: float | None = None):
     """Usage as a number, a ring, both, or split bars, colored like the bars."""
     from PIL import Image, ImageDraw
 
@@ -1208,16 +1210,28 @@ def render_tray_icon(util: float, style: str, segments: int = 5):
         gap = n * TRAY_BAR_GAP
         w = (n - gap * (segments - 1)) / segments
         r = int(w * 0.25)
+        bottom = n - 1
+        if time_progress is not None:
+            # Reset countdown runs along the bottom, under the usage bars.
+            th = round(n * TRAY_TIME_H)
+            ty = n - th
+            d.rectangle((0, ty, n - 1, n - 1), fill=BAR_BG)
+            tp = min(max(time_progress, 0.0), 1.0)
+            if tp > 0:
+                d.rectangle((0, ty, round((n - 1) * tp), n - 1), fill=TIME_BAR_FG)
+            bottom = ty - 1
+        # Square bottoms when the bars sit on the reset bar.
+        corners = (True, True, time_progress is None, time_progress is None)
         filled = util * segments
         for i in range(segments):
             x0 = round(i * (w + gap))
             x1 = round(x0 + w) - 1
-            d.rounded_rectangle((x0, 0, x1, n - 1), radius=r, fill=BAR_BG)
+            d.rounded_rectangle((x0, 0, x1, bottom), radius=r, fill=BAR_BG, corners=corners)
             part = min(max(filled - i, 0.0), 1.0)
             if part > 0:
-                top = round((n - 1) * (1 - part))
-                d.rounded_rectangle((x0, top, x1, n - 1),
-                                    radius=min(r, (n - 1 - top) // 2), fill=color)
+                top = round(bottom * (1 - part))
+                d.rounded_rectangle((x0, top, x1, bottom), radius=min(r, (bottom - top) // 2),
+                                    fill=color, corners=corners)
 
     if style in ("ring", "both"):
         w = n * (22 if style == "ring" else 14) // 100
@@ -1545,7 +1559,7 @@ class UsageWidget(tk.Tk):
         else:
             source, label = self._tray_meter()
             util = row[1]
-            image = render_tray_icon(util, self._tray_style(), tray_segments(row))
+            image = render_tray_icon(util, self._tray_style(), tray_segments(row), row[3])
             title = f"{SOURCE_TITLE.get(source, source)} {label}: {min(int(util * 100), 100)}%"
         try:
             self._tray.icon = image
