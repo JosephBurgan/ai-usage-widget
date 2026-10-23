@@ -917,7 +917,8 @@ def bar_color(util: float) -> str:
 
 TRAY_PX      = 64
 TRAY_SS      = 4            # supersample; PIL draws arcs without anti-aliasing
-TRAY_STYLES  = (("percent", "Number"), ("ring", "Ring"), ("both", "Both"))
+TRAY_STYLES  = (("percent", "Number"), ("ring", "Ring"), ("both", "Both"), ("bars", "Bars"))
+TRAY_BAR_GAP = 0.06         # gap between bars, as a fraction of the icon
 TRAY_DEFAULT_METER = ["claude", "5-hour"]
 TRAY_DOT     = 10           # px, meter-picker dot in settings mode
 
@@ -1181,8 +1182,18 @@ class TaskbarReadout:
                 pass
 
 
-def render_tray_icon(util: float, style: str):
-    """Usage as a number, a ring, or both, colored like the bars."""
+def tray_segments(row: Row) -> int:
+    """One bar per day for weekly windows, per hour for '5-hour' style labels."""
+    if row[4]:
+        return row[4]
+    head, _, unit = row[0].partition("-")
+    if unit.startswith("hour") and head.isdigit() and 1 < int(head) <= 12:
+        return int(head)
+    return 5
+
+
+def render_tray_icon(util: float, style: str, segments: int = 5):
+    """Usage as a number, a ring, both, or split bars, colored like the bars."""
     from PIL import Image, ImageDraw
 
     n = TRAY_PX * TRAY_SS
@@ -1191,6 +1202,22 @@ def render_tray_icon(util: float, style: str):
     util = min(max(util, 0.0), 1.0)
     color = bar_color(util)
     room = n
+
+    if style == "bars":
+        # Fills left to right; the bar in progress fills bottom-up.
+        gap = n * TRAY_BAR_GAP
+        w = (n - gap * (segments - 1)) / segments
+        r = int(w * 0.25)
+        filled = util * segments
+        for i in range(segments):
+            x0 = round(i * (w + gap))
+            x1 = round(x0 + w) - 1
+            d.rounded_rectangle((x0, 0, x1, n - 1), radius=r, fill=BAR_BG)
+            part = min(max(filled - i, 0.0), 1.0)
+            if part > 0:
+                top = round((n - 1) * (1 - part))
+                d.rounded_rectangle((x0, top, x1, n - 1),
+                                    radius=min(r, (n - 1 - top) // 2), fill=color)
 
     if style in ("ring", "both"):
         w = n * (22 if style == "ring" else 14) // 100
@@ -1512,12 +1539,13 @@ class UsageWidget(tk.Tk):
         self._update_readout()
         if self._tray is None:
             return
-        util = self._tray_util() if self._tray_dynamic() else None
-        if util is None:
+        row = self._tray_row() if self._tray_dynamic() else None
+        if row is None:
             image, title = self._tray_base, "AI Usage"
         else:
             source, label = self._tray_meter()
-            image = render_tray_icon(util, self._tray_style())
+            util = row[1]
+            image = render_tray_icon(util, self._tray_style(), tray_segments(row))
             title = f"{SOURCE_TITLE.get(source, source)} {label}: {min(int(util * 100), 100)}%"
         try:
             self._tray.icon = image
