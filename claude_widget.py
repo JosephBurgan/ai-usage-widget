@@ -913,6 +913,103 @@ def bar_color(util: float) -> str:
     return BAR_LOW
 
 
+# ── Dynamic tray icon ────────────────────────────────────────────────────────
+
+TRAY_PX      = 64
+TRAY_SS      = 4            # supersample; PIL draws arcs without anti-aliasing
+TRAY_STYLES  = (("percent", "Number"), ("ring", "Ring"), ("both", "Both"))
+TRAY_DEFAULT_METER = ["claude", "5-hour"]
+TRAY_DOT     = 10           # px, meter-picker dot in settings mode
+
+
+def _tray_font(size: int):
+    from PIL import ImageFont
+    try:
+        return ImageFont.truetype("segoeuib.ttf", size)
+    except OSError:
+        return ImageFont.load_default(size)
+
+
+def _fit_tray_text(draw, text: str, room: int, start: int):
+    size = start
+    while size > 8:
+        font = _tray_font(size)
+        l, t, r, b = draw.textbbox((0, 0), text, font=font)
+        if r - l <= room and b - t <= room:
+            return font
+        size -= 2
+    return _tray_font(size)
+
+
+def _draw_centered(draw, n: int, text: str, font, fill: str) -> None:
+    """Center on the glyphs' own box so '4' and '13' sit in the same spot."""
+    l, t, r, b = draw.textbbox((0, 0), text, font=font, anchor="lt")
+    draw.text(((n - (r - l)) / 2 - l, (n - (b - t)) / 2 - t), text,
+              fill=fill, font=font, anchor="lt")
+
+
+TRAY_SIGN_SCALE = 0.5      # % at half height leaves more width for the digits
+TRAY_SIGN_GAP   = 0.02
+
+
+def _draw_number_with_sign(draw, n: int, text: str, sizing: str, fill: str) -> None:
+    def widths(size: int):
+        big, small = _tray_font(size), _tray_font(max(8, int(size * TRAY_SIGN_SCALE)))
+        l, t, r, b = draw.textbbox((0, 0), sizing, font=big, anchor="ls")
+        sl, st, sr, sb = draw.textbbox((0, 0), "%", font=small, anchor="ls")
+        return big, small, (r - l) + n * TRAY_SIGN_GAP + (sr - sl), b - t
+
+    size = int(n * 1.2)
+    while size > 8:
+        big, small, total_w, h = widths(size)
+        if total_w <= n and h <= n:
+            break
+        size -= 2
+
+    l, t, r, b = draw.textbbox((0, 0), text, font=big, anchor="ls")
+    sl, st, sr, sb = draw.textbbox((0, 0), "%", font=small, anchor="ls")
+    w = (r - l) + n * TRAY_SIGN_GAP + (sr - sl)
+    x = (n - w) / 2 - l
+    base = (n + (b - t)) / 2 - b       # digits' own box centered vertically
+    draw.text((x, base), text, fill=fill, font=big, anchor="ls")
+    # Sign sits on the digits' top line, like a superscript.
+    draw.text((x + l + (r - l) + n * TRAY_SIGN_GAP - sl, base + t - st), "%",
+              fill=fill, font=small, anchor="ls")
+
+
+def render_tray_icon(util: float, style: str):
+    """Usage as a number, a ring, or both, colored like the bars."""
+    from PIL import Image, ImageDraw
+
+    n = TRAY_PX * TRAY_SS
+    img = Image.new("RGBA", (n, n), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    util = min(max(util, 0.0), 1.0)
+    color = bar_color(util)
+    room = n
+
+    if style in ("ring", "both"):
+        w = n * (22 if style == "ring" else 14) // 100
+        box = (0, 0, n - 1, n - 1)
+        d.ellipse(box, outline=BAR_BG, width=w)
+        if util > 0:
+            d.arc(box, -90, -90 + 360 * util, fill=color, width=w)
+        room = int((n - 2 * w) * 0.72)   # square that fits inside the hole
+
+    if style in ("percent", "both"):
+        pct = min(int(util * 100), 100)
+        text = str(pct)
+        # One size for every 1-2 digit value; only 100 gets its own fit.
+        sizing = text if pct == 100 else "88"
+        if style == "percent":
+            _draw_number_with_sign(d, n, text, sizing, color)
+        else:
+            font = _fit_tray_text(d, sizing, room, int(room * 1.6))
+            _draw_centered(d, n, text, font, color)
+
+    return img.resize((TRAY_PX, TRAY_PX), Image.LANCZOS)
+
+
 class UsageWidget(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1153,9 +1250,60 @@ class UsageWidget(tk.Tk):
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Quit", quit_app),
         )
+        self._tray_base = image
         self._tray = pystray.Icon("claude-usage-widget", image,
                                   "AI Usage", menu)
         threading.Thread(target=self._tray.run, daemon=True).start()
+
+    def _tray_dynamic(self) -> bool:
+        return bool(self._settings.get("tray_dynamic", True))
+
+    def _tray_style(self) -> str:
+        style = self._settings.get("tray_style")
+        return style if style in dict(TRAY_STYLES) else "percent"
+
+    def _tray_meter(self) -> tuple[str, str]:
+        raw = self._settings.get("tray_meter")
+        if isinstance(raw, list) and len(raw) == 2:
+            return str(raw[0]), str(raw[1])
+        return TRAY_DEFAULT_METER[0], TRAY_DEFAULT_METER[1]
+
+    def _tray_util(self) -> float | None:
+        source, label = self._tray_meter()
+        panel = self._panels.get(source)
+        if not panel or panel[0] != "ok":
+            return None
+        for row in panel[1]:
+            if row[0] == label:
+                return row[1]
+        return None
+
+    def _update_tray_icon(self) -> None:
+        if self._tray is None:
+            return
+        util = self._tray_util() if self._tray_dynamic() else None
+        if util is None:
+            image, title = self._tray_base, "AI Usage"
+        else:
+            source, label = self._tray_meter()
+            image = render_tray_icon(util, self._tray_style())
+            title = f"{SOURCE_TITLE.get(source, source)} {label}: {min(int(util * 100), 100)}%"
+        try:
+            self._tray.icon = image
+            self._tray.title = title
+        except Exception:  # noqa: BLE001 — tray thread may be gone at shutdown
+            pass
+
+    def _set_tray_setting(self, key: str, value) -> str | None:
+        self._settings[key] = value
+        try:
+            save_settings(self._settings)
+        except OSError as exc:
+            return str(exc)
+        self._update_tray_icon()
+        if self._manage_mode and self._last_rows:
+            self._render(self._last_rows)
+        return None
 
     def _after_safe(self, *args, remember_id: bool = False, **kwargs) -> None:
         """`self.after` that silently no-ops if the window has been destroyed.
@@ -1229,6 +1377,7 @@ class UsageWidget(tk.Tk):
     def _on_fetch_success(self, panels: dict[str, tuple]) -> None:
         self._panels = panels
         self._show_active()
+        self._update_tray_icon()
         self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
 
     def _show_source(self, name: str) -> bool:
@@ -1566,12 +1715,12 @@ class UsageWidget(tk.Tk):
         opts = tk.Frame(panel, bg=BG)
         opts.pack(fill="x", pady=(6, 0))
 
-        tk.Label(opts, text="Accounts", bg=BG, fg=FG_DIM,
-                 font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(anchor="w")
+        self._add_section_header(opts, "Accounts", first=True)
         self._accounts_frame = tk.Frame(opts, bg=BG)
         self._accounts_frame.pack(fill="x")
         self._refresh_account_rows()
 
+        self._add_section_header(opts, "Window")
         self._make_checkbox(
             opts, "Launch on startup",
             get_state=is_startup_enabled,
@@ -1587,6 +1736,48 @@ class UsageWidget(tk.Tk):
             get_state=lambda: self._settings.get("remember_position", True),
             set_state=self._set_remember_position,
         )
+
+        if self._tray is not None:
+            self._add_section_header(opts, "Tray icon")
+            self._make_checkbox(
+                opts, "Show usage in tray icon",
+                get_state=self._tray_dynamic,
+                set_state=lambda on: self._set_tray_setting("tray_dynamic", bool(on)),
+            )
+            self._tray_style_frame = tk.Frame(opts, bg=BG)
+            self._tray_style_frame.pack(fill="x", pady=(4, 0))
+            self._render_tray_styles()
+            tk.Label(opts, text="Pick the meter with ○ next to a bar.",
+                     bg=BG, fg=FG_DIM, font=("Segoe UI", 7),
+                     bd=0, padx=0, pady=0).pack(anchor="w", pady=(3, 0))
+
+    def _add_section_header(self, parent: tk.Misc, text: str, first: bool = False) -> None:
+        if not first:
+            tk.Frame(parent, bg=SEPARATOR, height=1).pack(fill="x", pady=(8, 4))
+        tk.Label(parent, text=text, bg=BG, fg=FG_DIM,
+                 font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(anchor="w")
+
+    def _render_tray_styles(self) -> None:
+        frame = self._tray_style_frame
+        for child in frame.winfo_children():
+            child.destroy()
+        current = self._tray_style()
+        for key, title in TRAY_STYLES:
+            active = key == current
+            btn = tk.Label(
+                frame, text=title, bg=BTN_BG if active else BG,
+                fg=FG if active else FG_DIM,
+                font=("Segoe UI", 8, "bold" if active else "normal"),
+                highlightthickness=1,
+                highlightbackground=FG_DIM if active else ACCENT_OFF,
+                cursor="hand2", bd=0, padx=6, pady=1,
+            )
+            btn.pack(side="left", padx=(0, 4))
+            btn.bind("<Button-1>", lambda _e, k=key: self._pick_tray_style(k))
+
+    def _pick_tray_style(self, key: str) -> None:
+        self._set_tray_setting("tray_style", key)
+        self._render_tray_styles()
 
     def _set_minimize_on_close(self, enabled: bool) -> str | None:
         self._settings["minimize_on_close"] = bool(enabled)
@@ -1998,6 +2189,17 @@ class UsageWidget(tk.Tk):
         tk.Label(top, text=f"{pct}%", bg=BG, fg=active_bar,
                  font=("Segoe UI", 8, "bold"),
                  bd=0, padx=0, pady=0).pack(side="right")
+
+        if self._manage_mode and self._tray is not None and self._tray_dynamic():
+            picked = self._tray_meter() == (self._source, label)
+            # Drawn, not a glyph: ○ and ● render at different sizes.
+            dot = tk.Canvas(top, width=TRAY_DOT, height=TRAY_DOT, bg=BG,
+                            highlightthickness=0, bd=0, cursor="hand2")
+            dot.create_oval(1, 1, TRAY_DOT - 2, TRAY_DOT - 2, outline=FG,
+                            width=1, fill=FG if picked else BG)
+            dot.pack(side="right", padx=(0, 6))
+            dot.bind("<Button-1>", lambda _e, l=label: self._set_tray_setting(
+                "tray_meter", [self._source, l]))
 
         # Usage bar
         usage_bar = tk.Frame(row, bg=BAR_BG, height=BAR_H)

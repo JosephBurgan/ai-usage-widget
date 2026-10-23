@@ -13,6 +13,8 @@ A small always-on-top floating window for Windows that shows your Claude.ai plan
 - Click the pin (📌) to toggle always-on-top
 - Click the gear (⚙) to enter manage mode — hide rows you don't care about
 - Hidden-row preferences persist across restarts
+- Tray icon shows live usage as a number, a colored ring, or both. Pick the meter with
+  the dot next to any bar in settings mode; turn it off under ≡ → Tray icon
 
 ## Requirements
 
