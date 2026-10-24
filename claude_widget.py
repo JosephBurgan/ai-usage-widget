@@ -244,6 +244,97 @@ def open_claude_login() -> bool:
     return True
 
 
+GROK_INSTALL_URL = "https://x.ai/cli/install.ps1"
+
+
+def find_grok_cli() -> str | None:
+    """Path to the Grok CLI, or None when it is not installed.
+
+    The official Windows installer puts grok.exe in ~/.grok/bin and only then
+    updates the user PATH, which a widget already running will not see.
+    """
+    names = ("grok.exe", "grok.cmd", "grok")
+    folders: list[Path] = []
+    env_dir = os.environ.get("GROK_BIN_DIR")
+    if env_dir:
+        folders.append(Path(env_dir))
+    folders.append(HOME / ".grok" / "bin")
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        folders.append(Path(appdata) / "npm")
+    for folder in folders:
+        for name in names:
+            path = folder / name
+            if path.is_file():
+                return str(path)
+    return shutil.which("grok")
+
+
+def grok_auth_mtime() -> int | None:
+    try:
+        return GROK_AUTH.stat().st_mtime_ns
+    except OSError:
+        return None
+
+
+def _ps_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def _open_visible_powershell(script: str) -> bool:
+    """Run script in a new PowerShell window. False if the shell cannot start."""
+    try:
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
+             "-Command", script],
+            cwd=str(HOME),
+            creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
+        )
+    except OSError:
+        return False
+    return True
+
+
+_GROK_PAUSE = (
+    "Write-Host ''; "
+    "Write-Host 'Press Enter to close this window.'; "
+    "[void](Read-Host)"
+)
+
+
+def open_grok_login() -> bool:
+    """Open a visible window running `grok login`. False if the CLI is not installed."""
+    exe = find_grok_cli()
+    if not exe:
+        return False
+    return _open_visible_powershell(f"& {_ps_quote(exe)} login; {_GROK_PAUSE}")
+
+
+def open_grok_install_and_login() -> bool:
+    """Visible PowerShell: official installer, then `grok login`."""
+    url = _ps_quote(GROK_INSTALL_URL)
+    script = (
+        "$ErrorActionPreference = 'Stop'; "
+        "try { "
+        f"irm {url} | iex; "
+        "$bin = if ($env:GROK_BIN_DIR) { $env:GROK_BIN_DIR } "
+        "else { Join-Path $env:USERPROFILE '.grok\\bin' }; "
+        "$grok = Join-Path $bin 'grok.exe'; "
+        "if (-not (Test-Path -LiteralPath $grok)) { "
+        "throw ('Installer finished but ' + $grok + ' was not found.') }; "
+        "& $grok login "
+        "} catch { "
+        "Write-Host ''; "
+        "Write-Host ('Could not sign in: ' + $_.Exception.Message); "
+        "Write-Host 'Install by hand in PowerShell:'; "
+        f"Write-Host ('  irm {url} | iex'); "
+        "Write-Host '  grok login' "
+        "}; "
+        + _GROK_PAUSE
+    )
+    return _open_visible_powershell(script)
+
+
 def source_has_creds(name: str) -> bool:
     if name == "claude":
         return claude_connected()
@@ -256,15 +347,26 @@ def source_has_creds(name: str) -> bool:
 
 LOGIN_URLS = {
     "claude":  "https://claude.com/product/claude-code",
-    "grok":    "https://grok.com",
     "chatgpt": "https://chatgpt.com",
 }
 
 LOGIN_HINTS = {
     "claude":  "Reads your Claude Code login,\nnot the claude.ai website.\nSign in opens Claude Code in a\nterminal; run /login there.",
-    "grok":    "Run 'grok login' in a terminal\nto refresh credentials.",
+    "grok":    "Sign in opens a terminal and runs\ngrok login. Finish it there and\nthis tab updates on its own.",
     "chatgpt": "Sign in on chatgpt.com.\nUsage meters for ChatGPT\nare not wired up yet.",
 }
+
+GROK_INSTALL_HINT = (
+    "The Grok CLI isn't installed.\n"
+    "Sign in opens PowerShell, installs\n"
+    "it from x.ai, then runs grok login."
+)
+
+GROK_LOGIN_FAILED = (
+    "Couldn't open PowerShell.\n"
+    "Install the Grok CLI, then run grok login:\n"
+    "irm https://x.ai/cli/install.ps1 | iex"
+)
 
 
 def _parse_expires_at(raw: object) -> float | None:
@@ -565,6 +667,9 @@ def install_update() -> str | None:
 
 
 APP_NAME = "AI Usage Widget"
+# Startup-folder shortcut only. A Start Menu launch omits this so the window opens.
+STARTUP_ARG = "--from-startup"
+STARTUP_LNK_REV = 1
 
 
 def _startup_dir() -> Path:
@@ -611,7 +716,7 @@ def set_startup_enabled(enabled: bool) -> str | None:
         f'$sh = New-Object -ComObject WScript.Shell;'
         f'$lnk = $sh.CreateShortcut("{path}");'
         f'$lnk.TargetPath = "wscript.exe";'
-        f"$lnk.Arguments = '\"{vbs}\"';"
+        f"$lnk.Arguments = '\"{vbs}\" {STARTUP_ARG}';"
         f'$lnk.WorkingDirectory = "{REPO_DIR}";'
         + (f'$lnk.IconLocation = "{icon}";' if icon.exists() else "")
         + '$lnk.Description = "Floating AI usage widget";'
@@ -628,6 +733,38 @@ def set_startup_enabled(enabled: bool) -> str | None:
     if r.returncode != 0:
         return (r.stderr or "Failed to create shortcut").strip()
     return None
+
+
+def launched_from_startup() -> bool:
+    return STARTUP_ARG in sys.argv
+
+
+def seed_startup_settings_file(path: Path, shortcut: Path) -> tuple[bool, bool]:
+    """Fill launch prefs when they are missing and return (launch, tray_only).
+
+    A new settings file turns Launch on startup on and leaves the window open.
+    An existing file keeps whatever the Startup shortcut already says.
+    """
+    had = path.exists()
+    try:
+        data = _read_json(path) if had else {}
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    changed = False
+    if "launch_on_startup" not in data:
+        data["launch_on_startup"] = True if not had else shortcut.exists()
+        changed = True
+    if "startup_tray_only" not in data:
+        data["startup_tray_only"] = False
+        changed = True
+    if data.get("launch_on_startup") and "startup_lnk_rev" not in data:
+        data["startup_lnk_rev"] = STARTUP_LNK_REV
+        changed = True
+    if changed:
+        _write_json_atomic(path, data)
+    return bool(data["launch_on_startup"]), bool(data["startup_tray_only"])
 
 
 _k32 = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -1053,7 +1190,7 @@ def _draw_number_with_sign(draw, n: int, text: str, sizing: str, fill: str) -> N
               fill=fill, font=small, anchor="ls")
 
 
-# ── Taskbar readout (experimental) ───────────────────────────────────────────
+# ── Taskbar readout ──────────────────────────────────────────────────────────
 # Windows 11 has no API for putting UI on the taskbar. A child window of
 # Shell_TrayWnd is drawn under the taskbar's XAML layer, so instead this is a
 # borderless window owned by the taskbar (owned windows always stack above
@@ -1253,6 +1390,12 @@ class TaskbarReadout:
             self._lbl = tk.Label(self._win, bd=0, bg=self._bg, cursor="hand2")
             self._lbl.bind("<Button-1>", lambda _e: self._on_click())
             self._win.update_idletasks()
+            # The main window may be withdrawn at sign-in. Map this window on
+            # its own so the taskbar readout still shows.
+            try:
+                self._win.deiconify()
+            except tk.TclError:
+                pass
             self._bar = 0
         hwnd = self._hwnd()
         u32 = ctypes.windll.user32
@@ -1271,6 +1414,12 @@ class TaskbarReadout:
             self._data_drawn = None
         # Tk doesn't always move a reowned window, and clicking the taskbar can
         # raise it over us, so pin the spot and z-order every poll.
+        # A withdrawn main window must not take this readout with it.
+        try:
+            if str(self._win.state()) == "withdrawn":
+                self._win.deiconify()
+        except tk.TclError:
+            pass
         x, y, w, h = self._slot
         u32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                                      ctypes.c_int, ctypes.c_int, wintypes.UINT)
@@ -1305,7 +1454,7 @@ class TaskbarReadout:
             # top highlight) shows; edges stay anti-aliased against that color.
             self._win.attributes("-transparentcolor", self._bg)
             self._data_drawn = data
-        except Exception:  # noqa: BLE001 — experimental; never take the widget down
+        except Exception:  # noqa: BLE001 — a readout failure must not take the widget down
             self.hide()
 
     def hide(self) -> None:
@@ -1446,6 +1595,8 @@ class UsageWidget(tk.Tk):
         self._drag_x      = 0
         self._drag_y      = 0
         self._settings    = load_settings()
+        self._login_notice = ""
+        self._sync_startup_pref()
         if "hidden" not in self._settings:
             # First launch: seed with sensible defaults so the user can re-enable
             # any of them from the settings panel.
@@ -1487,7 +1638,6 @@ class UsageWidget(tk.Tk):
         self.minsize(self._chrome_w, 1)
         self.maxsize(self._chrome_w, self.winfo_screenheight())
         self._place_initial()
-        self.lift()
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._setup_tray()
@@ -1497,6 +1647,12 @@ class UsageWidget(tk.Tk):
         self._show_event_tick()
         self._schedule_refresh()
         self._refresh_icons_if_changed()
+        if self._start_tray_only():
+            # Withdraw before the window is mapped so sign-in doesn't flash it.
+            self.withdraw()
+            self._update_tray_icon()
+        else:
+            self.lift()
 
         # Auto-check for updates a few seconds after startup so we don't
         # delay first paint.
@@ -1627,6 +1783,7 @@ class UsageWidget(tk.Tk):
         if self.state() == "withdrawn":
             self.deiconify()
         self.lift()
+        self._update_tray_icon()
         # Force topmost briefly so we surface over other apps. If the user
         # hasn't pinned us, drop the topmost flag again after a moment so
         # the window doesn't permanently stick.
@@ -1655,6 +1812,47 @@ class UsageWidget(tk.Tk):
             self._manage_mode = False
             self._gear_btn.config(fg=ACCENT)
         self.withdraw()
+        self._update_tray_icon()
+
+    def _sync_startup_pref(self) -> None:
+        """Keep the settings file and the Startup shortcut on the same choice."""
+        changed = False
+        if "launch_on_startup" not in self._settings:
+            self._settings["launch_on_startup"] = is_startup_enabled()
+            changed = True
+        if "startup_tray_only" not in self._settings:
+            self._settings["startup_tray_only"] = False
+            changed = True
+        want = bool(self._settings.get("launch_on_startup"))
+        stale = want and self._settings.get("startup_lnk_rev") != STARTUP_LNK_REV
+        if want != is_startup_enabled() or stale:
+            err = set_startup_enabled(want)
+            if err:
+                if changed:
+                    try:
+                        save_settings(self._settings)
+                    except OSError:
+                        pass
+                return
+            if want:
+                self._settings["startup_lnk_rev"] = STARTUP_LNK_REV
+            else:
+                self._settings.pop("startup_lnk_rev", None)
+            changed = True
+        if changed:
+            try:
+                save_settings(self._settings)
+            except OSError:
+                pass
+
+    def _start_tray_only(self) -> bool:
+        """True when this process was launched at sign-in and should stay hidden."""
+        return (
+            launched_from_startup()
+            and bool(self._settings.get("launch_on_startup"))
+            and bool(self._settings.get("startup_tray_only"))
+            and self._tray is not None
+        )
 
     # ── tray ──────────────────────────────────────────────────────────────────
 
@@ -1775,6 +1973,8 @@ class UsageWidget(tk.Tk):
             image = render_tray_icon(util, self._tray_style(), tray_segments(row), row[3])
             title = f"{SOURCE_TITLE.get(source, source)} {label}: {min(int(util * 100), 100)}%"
         try:
+            if self.state() == "withdrawn":
+                title = f"{title} — click to open"
             self._tray.icon = image
             self._tray.title = title
         except Exception:  # noqa: BLE001 — tray thread may be gone at shutdown
@@ -1862,6 +2062,9 @@ class UsageWidget(tk.Tk):
 
     def _on_fetch_success(self, panels: dict[str, tuple]) -> None:
         self._panels = panels
+        grok = panels.get("grok")
+        if grok and grok[0] == "ok":
+            self._login_notice = ""
         self._show_active()
         self._update_tray_icon()
         self._ts_lbl.config(text=time.strftime("Updated %H:%M:%S"))
@@ -1977,6 +2180,7 @@ class UsageWidget(tk.Tk):
         return None
 
     def _sign_in(self, name: str) -> None:
+        was_local = name in self._signed_out_set()
         gone = self._signed_out_set()
         gone.discard(name)
         self._settings["signed_out"] = sorted(gone)
@@ -1984,28 +2188,59 @@ class UsageWidget(tk.Tk):
             save_settings(self._settings)
         except OSError:
             pass
-        if not source_has_creds(name):
-            if name == "claude" and open_claude_login():
-                self._watch_for_creds(name, time.time() + CREDS_WATCH_S)
+        has_creds = source_has_creds(name)
+        panel = self._panels.get(name)
+        # A local Sign out keeps the credential file. Signing back in reconnects
+        # it. A missing file, or tokens the API rejected, has to go through login.
+        rejected = (
+            name == "grok" and has_creds and not was_local
+            and bool(panel) and panel[0] == "auth"
+        )
+        if name == "claude":
+            if not has_creds:
+                if open_claude_login():
+                    self._watch_for_creds(name, time.time() + CREDS_WATCH_S)
+                else:
+                    url = LOGIN_URLS.get("claude")
+                    if url:
+                        webbrowser.open(url)
+        elif name == "grok" and (not has_creds or rejected):
+            self._login_notice = ""
+            since = grok_auth_mtime()
+            started = open_grok_login() if find_grok_cli() else open_grok_install_and_login()
+            if started:
+                self._watch_for_creds(name, time.time() + CREDS_WATCH_S, since)
             else:
-                url = LOGIN_URLS.get(name)
-                if url:
-                    webbrowser.open(url)
+                self._login_notice = GROK_LOGIN_FAILED
+        elif not has_creds:
+            url = LOGIN_URLS.get(name)
+            if url:
+                webbrowser.open(url)
         self._refresh_account_rows()
         if self._show_source(name):
             self._source = name
         self._show_active()
         self._manual_refresh()
 
-    def _watch_for_creds(self, name: str, deadline: float) -> None:
-        """Refresh as soon as the terminal login writes credentials."""
+    def _watch_for_creds(self, name: str, deadline: float, since: int | None = None) -> None:
+        """Refresh as soon as the terminal login writes credentials.
+
+        `since` is the previous auth-file mtime. Pass it when a rejected file
+        is already on disk so the watch waits for `grok login` to replace it.
+        """
         if self._destroyed or time.time() > deadline:
             return
-        if source_has_creds(name):
+        ready = source_has_creds(name)
+        if since is not None:
+            ready = ready and grok_auth_mtime() != since
+        if ready:
+            self._login_notice = ""
             self._refresh_account_rows()
             self._manual_refresh()
-            return
-        self._after_safe(2000, self._watch_for_creds, name, deadline)
+            if since is None:
+                return
+            since = grok_auth_mtime()
+        self._after_safe(2000, self._watch_for_creds, name, deadline, since)
 
     def _sign_out(self, name: str) -> None:
         gone = self._signed_out_set()
@@ -2207,11 +2442,21 @@ class UsageWidget(tk.Tk):
         self._refresh_account_rows()
 
         self._add_section_header(opts, "Window")
+        startup_block = tk.Frame(opts, bg=BG)
+        startup_block.pack(fill="x")
         self._make_checkbox(
-            opts, "Launch on startup",
-            get_state=is_startup_enabled,
-            set_state=set_startup_enabled,
+            startup_block, "Launch on startup",
+            get_state=lambda: bool(self._settings.get("launch_on_startup", False)),
+            set_state=self._set_launch_on_startup,
         )
+        self._startup_tray_row = tk.Frame(startup_block, bg=BG)
+        self._make_checkbox(
+            self._startup_tray_row, "Taskbar icon only",
+            get_state=lambda: bool(self._settings.get("startup_tray_only", False)),
+            set_state=self._set_startup_tray_only,
+            indent=14,
+        )
+        self._sync_startup_tray_row()
         self._make_checkbox(
             opts, "Keep minimized on close",
             get_state=lambda: self._settings.get("minimize_on_close", False),
@@ -2234,7 +2479,7 @@ class UsageWidget(tk.Tk):
             self._tray_style_frame.pack(fill="x", pady=(4, 0))
             self._render_tray_styles()
             self._make_checkbox(
-                opts, "Readout on taskbar (experimental)",
+                opts, "Readout on taskbar",
                 get_state=self._readout_on,
                 set_state=lambda on: self._set_tray_setting("taskbar_readout", bool(on)),
             )
@@ -2297,6 +2542,43 @@ class UsageWidget(tk.Tk):
         self._set_tray_setting("readout_bar_meters", key)
         self._render_readout_styles()
 
+    def _set_launch_on_startup(self, enabled: bool) -> str | None:
+        err = set_startup_enabled(enabled)
+        if err:
+            return err
+        self._settings["launch_on_startup"] = bool(enabled)
+        if enabled:
+            self._settings["startup_lnk_rev"] = STARTUP_LNK_REV
+        else:
+            self._settings.pop("startup_lnk_rev", None)
+        try:
+            save_settings(self._settings)
+        except OSError as exc:
+            return str(exc)
+        self._sync_startup_tray_row()
+        return None
+
+    def _set_startup_tray_only(self, enabled: bool) -> str | None:
+        if enabled and self._tray is None:
+            return "Install the tray icon first."
+        self._settings["startup_tray_only"] = bool(enabled)
+        try:
+            save_settings(self._settings)
+        except OSError as exc:
+            return str(exc)
+        return None
+
+    def _sync_startup_tray_row(self) -> None:
+        """Taskbar icon only is a child of Launch on startup."""
+        row = getattr(self, "_startup_tray_row", None)
+        if row is None or not row.winfo_exists():
+            return
+        if self._settings.get("launch_on_startup"):
+            if not row.winfo_ismapped():
+                row.pack(fill="x")
+        else:
+            row.pack_forget()
+
     def _set_minimize_on_close(self, enabled: bool) -> str | None:
         self._settings["minimize_on_close"] = bool(enabled)
         try:
@@ -2319,16 +2601,22 @@ class UsageWidget(tk.Tk):
         return None
 
     def _make_checkbox(self, parent: tk.Misc, label: str,
-                        get_state, set_state) -> tk.Frame:
+                        get_state, set_state, *, indent: int = 0) -> tk.Frame:
         """Settings-row checkbox styled to match the row hide checkboxes.
 
         get_state: () -> bool
         set_state: (new_value: bool) -> str | None   (returns error or None)
+        indent: left inset, with a bullet, for a child of the row above.
         """
         row = tk.Frame(parent, bg=BG)
         row.pack(fill="x", pady=(2, 0))
 
         state = {"on": bool(get_state())}
+
+        if indent:
+            bullet = tk.Label(row, text="•", bg=BG, fg=FG_DIM,
+                              font=("Segoe UI", 8), bd=0, pady=0)
+            bullet.pack(side="left", padx=(indent, 2))
 
         box = tk.Label(row, text="☑" if state["on"] else "☐",
                        bg=BG, fg=FG, font=("Segoe UI", 9),
@@ -2790,17 +3078,29 @@ class UsageWidget(tk.Tk):
         for w in self._body.winfo_children():
             w.destroy()
 
+    def _login_hint(self, name: str) -> str:
+        if name == "grok" and self._login_notice:
+            return self._login_notice
+        if name == "grok" and not find_grok_cli():
+            return GROK_INSTALL_HINT
+        return LOGIN_HINTS.get(name, "Sign in to connect this account.")
+
+    def _login_button_label(self, name: str) -> str:
+        if name == "grok" and not find_grok_cli():
+            return "Install and sign in"
+        return "Sign in"
+
     def _show_login(self) -> None:
         self._reset_body()
         name = self._source
         tk.Label(self._body, text="Not signed in", bg=BG, fg=FG_DIM,
                  font=("Segoe UI", 8)).pack(anchor="w")
-        hint = LOGIN_HINTS.get(name, "Sign in to connect this account.")
+        hint = self._login_hint(name)
         tk.Label(self._body, text=hint,
                  bg=BG, fg=FG, font=("Segoe UI", 8), justify="left",
                  wraplength=self._inner_w()).pack(anchor="w", pady=(4, 0))
         btn = self._make_action_button(
-            self._body, "Sign in", lambda n=name: self._sign_in(n),
+            self._body, self._login_button_label(name), lambda n=name: self._sign_in(n),
         )
         btn.pack(fill="x", pady=(8, 0))
         self._ts_lbl.config(text="")
