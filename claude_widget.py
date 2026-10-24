@@ -76,7 +76,8 @@ def save_settings(s: dict) -> None:
 
 
 # Rows hidden by default on first launch (user can re-enable from settings).
-DEFAULT_HIDDEN = ["7-day Sonnet", "Extra credits"]
+# "Bot app" repeats the Grok weekly pool, so it starts hidden too.
+DEFAULT_HIDDEN = ["7-day Sonnet", "Extra credits", "Bot app"]
 
 
 # ── OAuth / API ──────────────────────────────────────────────────────────────
@@ -204,7 +205,24 @@ GROK_PRODUCT_LABELS = {
     "GrokVoice":   "Voice",
     "GrokAPI":     "API",
     "GrokBot":     "Grok Bot",
+    "Cursor":      "Cursor",
+    "GrokCursor":  "Cursor",
 }
+
+# Category colors for the stacked weekly bar. Kept off the green / orange / red
+# status palette so those still mean "how full", not "which product".
+GROK_SLICE_COLORS = {
+    "Grok Bot": "#6ea8fe",
+    "Cursor":   "#c084fc",
+    "Voice":    "#2dd4bf",
+    "Build":    "#e8a87c",
+    "Chat":     "#7dd3fc",
+    "Imagine":  "#f472b6",
+    "API":      "#facc15",
+}
+GROK_SLICE_FALLBACK = (
+    "#818cf8", "#fb7185", "#38bdf8", "#e879f9", "#a78bfa", "#22d3ee", "#fdba74",
+)
 
 
 def grok_connected() -> bool:
@@ -979,6 +997,11 @@ def _weekly_reset_clock(resets_at_iso: str, window_s: int | None) -> str:
 
 Row = tuple[str, float, str, float | None, int | None, str]
 # (label, utilization 0..1, sublabel, time_progress, day notches, weekly reset clock)
+# Grok rows may add a 7th field: pool, slice, bot, or bot-same.
+
+
+def row_kind(row: tuple) -> str:
+    return row[6] if len(row) > 6 else ""
 
 
 def parse_usage(data: dict) -> list[Row]:
@@ -1051,6 +1074,33 @@ def _cents_to_dollars(val_obj: object) -> float:
         return 0.0
 
 
+def _iso_within(a: str, b: str, slack_s: int) -> bool:
+    try:
+        da = datetime.fromisoformat(a.replace("Z", "+00:00"))
+        db = datetime.fromisoformat(b.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return abs((da - db).total_seconds()) <= slack_s
+
+
+def bot_matches_pool(pool_pct: float, pool_end: str, bot: dict) -> bool:
+    """True when Bot app is the same weekly pool, not its own limit.
+
+    The desktop app's GetSandUsageStatus reports the account weekly limit:
+    same percent and the same reset. A different reset means a separate limit.
+    """
+    try:
+        bot_pct = float(bot["usagePercent"])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if abs(bot_pct - float(pool_pct)) > 1.0:
+        return False
+    bot_end = str(bot.get("nextReset") or "")
+    if pool_end and bot_end:
+        return _iso_within(pool_end, bot_end, 180)
+    return True
+
+
 def parse_grok_usage(data: dict) -> tuple[list[Row], str]:
     rows: list[Row] = []
     cfg = data.get("config") or data
@@ -1069,10 +1119,12 @@ def parse_grok_usage(data: dict) -> tuple[list[Row], str]:
         used_pct = 0.0
 
     countdown = _fmt_countdown(end) if end else ""
+    # 7th field marks the weekly pool. productUsage entries are slices of it.
     rows.append((
         label, float(used_pct) / 100.0, countdown,
         _time_progress(end, window_s) if end else None, _week_notches(window_s),
         _weekly_reset_clock(end, window_s),
+        "pool",
     ))
 
     for item in cfg.get("productUsage") or []:
@@ -1083,6 +1135,7 @@ def parse_grok_usage(data: dict) -> tuple[list[Row], str]:
         rows.append((
             GROK_PRODUCT_LABELS.get(product, product or "Product"),
             float(pct) / 100.0, "", None, None, "",
+            "slice",
         ))
 
     bot = data.get("_bot") or {}
@@ -1090,12 +1143,14 @@ def parse_grok_usage(data: dict) -> tuple[list[Row], str]:
         bot_end = str(bot.get("nextReset") or "")
         bot_start = str(bot.get("periodStart") or "")
         bot_window = _period_window_s(None, bot_start, bot_end)
+        kind = "bot-same" if bot_matches_pool(float(used_pct), end, bot) else "bot"
         rows.append((
             BOT_LABEL, float(bot["usagePercent"]) / 100.0,
             _fmt_countdown(bot_end) if bot_end else "",
             _time_progress(bot_end, bot_window) if bot_end else None,
             _week_notches(bot_window),
             _weekly_reset_clock(bot_end, bot_window),
+            kind,
         ))
 
     on_cap = _cents_to_dollars(cfg.get("onDemandCap"))
@@ -1127,6 +1182,7 @@ BTN_BG_HOVER = "#3a3a3a"
 TIME_BAR_BG  = "#262626"   # slightly darker than BAR_BG
 TIME_BAR_FG  = "#999999"   # quiet light gray; day notches use this too
 BAR_H        = 6
+STACK_H      = 8            # Grok weekly bar, tall enough to read category colors
 TIME_BAR_H   = 2            # slim accent under the usage bar
 TICK_DROP    = 2            # hangs 2px under the time bar (50% taller than 1px)
 WIDTH        = 220
@@ -1145,6 +1201,45 @@ def bar_color(util: float) -> str:
     if util >= 0.9:  return BAR_HIGH
     if util >= 0.6:  return BAR_MED
     return BAR_LOW
+
+
+# Product slices within this many points of the weekly total are the same pool
+# (28+6+2+2+2 = 40 vs a weekly 41). Farther apart, keep each slice's own width.
+SLICE_MATCH_TOLERANCE = 0.05
+
+
+def stack_fractions(parts: list[float], pool: float, *, complete: bool) -> list[float]:
+    """Segment widths as fractions of the weekly limit (the full bar).
+
+    When every product is included and the parts add up to about the pool,
+    scale them so the stack ends on the weekly percent. Otherwise each part
+    keeps its own percent. The painted width never passes 100%.
+    """
+    clean = [max(0.0, float(p)) for p in parts]
+    total = sum(clean)
+    pool = min(max(float(pool), 0.0), 1.0)
+    if total <= 0 or not clean:
+        return [0.0 for _ in clean]
+    if complete and pool > 0 and abs(total - pool) <= SLICE_MATCH_TOLERANCE:
+        scale = pool / total
+    elif total > 1.0:
+        scale = 1.0 / total
+    else:
+        scale = 1.0
+    return [p * scale for p in clean]
+
+
+def grok_slice_color(label: str, used: set[str]) -> str:
+    color = GROK_SLICE_COLORS.get(label)
+    if color is None or color in used:
+        for candidate in GROK_SLICE_FALLBACK:
+            if candidate not in used:
+                color = candidate
+                break
+        else:
+            color = GROK_SLICE_FALLBACK[len(used) % len(GROK_SLICE_FALLBACK)]
+    used.add(color)
+    return color
 
 
 # ── Dynamic tray icon ────────────────────────────────────────────────────────
@@ -1225,6 +1320,110 @@ GWLP_HWNDPARENT  = -8
 HWND_TOPMOST     = -1
 SWP_NOACTIVATE   = 0x0010
 SWP_SHOWWINDOW   = 0x0040
+
+# Keep floating windows off the taskbar. rcWork is the monitor minus the taskbar,
+# whichever edge it sits on. Screen size includes the taskbar, so it is the wrong clamp.
+WORK_MARGIN = 8
+SPI_GETWORKAREA = 0x0030
+MONITOR_DEFAULTTONULL = 0
+MONITOR_DEFAULTTONEAREST = 2
+
+
+class _MONITORINFO(ctypes.Structure):
+    _fields_ = [
+        ("cbSize", wintypes.DWORD),
+        ("rcMonitor", wintypes.RECT),
+        ("rcWork", wintypes.RECT),
+        ("dwFlags", wintypes.DWORD),
+    ]
+
+
+def clamp_to_work_area(
+    x: int, y: int, w: int, h: int,
+    area: tuple[int, int, int, int],
+    margin: int = WORK_MARGIN,
+) -> tuple[int, int, int, int]:
+    """Fit a window inside area (left, top, right, bottom), inset by margin.
+
+    Shrinks width and height only when they would cross the inset edges.
+    """
+    left, top, right, bottom = (int(v) for v in area)
+    left += margin
+    top += margin
+    right -= margin
+    bottom -= margin
+    if right < left:
+        left = right
+    if bottom < top:
+        top = bottom
+    avail_w = max(1, right - left)
+    avail_h = max(1, bottom - top)
+    w = min(max(1, int(w)), avail_w)
+    h = min(max(1, int(h)), avail_h)
+    x = min(max(int(x), left), right - w)
+    y = min(max(int(y), top), bottom - h)
+    return x, y, w, h
+
+
+def _monitor_from_rect(x: int, y: int, w: int, h: int, flags: int):
+    """Monitor handle for the rect, or None when the API isn't there."""
+    if sys.platform != "win32":
+        return None
+    u32 = ctypes.windll.user32
+    if not hasattr(u32, "MonitorFromRect"):
+        return None
+    rect = wintypes.RECT(int(x), int(y), int(x) + max(int(w), 1), int(y) + max(int(h), 1))
+    try:
+        u32.MonitorFromRect.argtypes = (ctypes.POINTER(wintypes.RECT), wintypes.DWORD)
+        u32.MonitorFromRect.restype = ctypes.c_void_p
+        return u32.MonitorFromRect(ctypes.byref(rect), flags) or None
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        return None
+
+
+def _primary_work_area() -> tuple[int, int, int, int] | None:
+    if sys.platform != "win32":
+        return None
+    rect = wintypes.RECT()
+    u32 = ctypes.windll.user32
+    try:
+        u32.SystemParametersInfoW.argtypes = (
+            wintypes.UINT, wintypes.UINT, ctypes.c_void_p, wintypes.UINT,
+        )
+        u32.SystemParametersInfoW.restype = wintypes.BOOL
+        ok = u32.SystemParametersInfoW(SPI_GETWORKAREA, 0, ctypes.byref(rect), 0)
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        return None
+    if not ok or rect.right <= rect.left or rect.bottom <= rect.top:
+        return None
+    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+
+
+def work_area_for_rect(x: int, y: int, w: int, h: int) -> tuple[int, int, int, int] | None:
+    """Work area of the monitor under this rect. Falls back to the primary."""
+    hmon = _monitor_from_rect(x, y, w, h, MONITOR_DEFAULTTONEAREST)
+    if hmon:
+        info = _MONITORINFO()
+        info.cbSize = ctypes.sizeof(_MONITORINFO)
+        u32 = ctypes.windll.user32
+        try:
+            u32.GetMonitorInfoW.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+            u32.GetMonitorInfoW.restype = wintypes.BOOL
+            ok = u32.GetMonitorInfoW(hmon, ctypes.byref(info))
+        except (AttributeError, OSError, ctypes.ArgumentError):
+            ok = False
+        if ok:
+            r = info.rcWork
+            if r.right > r.left and r.bottom > r.top:
+                return int(r.left), int(r.top), int(r.right), int(r.bottom)
+    return _primary_work_area()
+
+
+def rect_on_monitor(x: int, y: int, w: int, h: int) -> bool | None:
+    """True when the rect hits a monitor. None if we can't ask Windows."""
+    if sys.platform != "win32" or not hasattr(ctypes.windll.user32, "MonitorFromRect"):
+        return None
+    return _monitor_from_rect(x, y, w, h, MONITOR_DEFAULTTONULL) is not None
 
 
 def _win_rect(hwnd: int) -> tuple[int, int, int, int] | None:
@@ -1620,12 +1819,8 @@ class UsageWidget(tk.Tk):
         self._settings    = load_settings()
         self._login_notice = ""
         self._sync_startup_pref()
-        if "hidden" not in self._settings:
-            # First launch: seed with sensible defaults so the user can re-enable
-            # any of them from the settings panel.
-            self._settings["hidden"] = list(DEFAULT_HIDDEN)
-            save_settings(self._settings)
-        self._hidden: set[str] = set(self._settings["hidden"])
+        self._seed_hidden()
+        self._settings_placed = False
         self._refresh_min = self._init_refresh_minutes()
         self._manage_mode = False
         self._last_rows: list[Row] = []
@@ -1720,7 +1915,9 @@ class UsageWidget(tk.Tk):
         tk.Label(self._body, text="Loading…", bg=BG, fg=FG_DIM,
                  font=("Segoe UI", 8)).pack(anchor="w")
 
-        self._make_refresh_button(self).pack(fill="x", padx=8, pady=(4, 2))
+        self._refresh_btn = self._make_refresh_button(self)
+        self._refresh_btn.pack(fill="x", padx=8, pady=(4, 2))
+        self._build_grok_color_toggle()
 
         self._ts_lbl = tk.Label(self, bg=BG, fg=FG_DIM, font=("Segoe UI", 7))
         self._ts_lbl.pack(anchor="e", padx=8, pady=(0, 4))
@@ -1746,34 +1943,116 @@ class UsageWidget(tk.Tk):
         except tk.TclError:
             pass
 
+    def _seed_hidden(self) -> None:
+        """Default hidden rows, plus a one-time hide of Bot app on existing installs."""
+        changed = False
+        if "hidden" not in self._settings:
+            self._settings["hidden"] = list(DEFAULT_HIDDEN)
+            changed = True
+        hidden = set(self._settings.get("hidden") or [])
+        # Bot app matches the weekly pool. Hide it once; if the user shows it
+        # again, leave that choice alone.
+        if not self._settings.get("bot_app_default_hidden"):
+            hidden.add(BOT_LABEL)
+            self._settings["bot_app_default_hidden"] = True
+            changed = True
+        self._settings["hidden"] = sorted(hidden)
+        self._hidden = hidden
+        if changed:
+            try:
+                save_settings(self._settings)
+            except OSError:
+                pass
+
     def _place_bottom_right(self) -> None:
         sw = self.winfo_screenwidth()
         sh = self.winfo_screenheight()
         self.geometry(f"+{sw - WIDTH - 20}+{sh - 220}")
+        self._fit_window(self)
+
+    def _saved_position_visible(self, x: int, y: int) -> bool:
+        w = max(self.winfo_reqwidth(), WIDTH)
+        h = max(self.winfo_reqheight(), 1)
+        on = rect_on_monitor(x, y, w, h)
+        if on is not None:
+            return on
+        sw = self.winfo_screenwidth()
+        sh = self.winfo_screenheight()
+        return -100 < x < sw - 50 and -100 < y < sh - 50
 
     def _place_initial(self) -> None:
         """Restore last-known position if the user opted in, else bottom-right."""
         if self._settings.get("remember_position", True):
             x = self._settings.get("window_x")
             y = self._settings.get("window_y")
-            if isinstance(x, int) and isinstance(y, int):
-                sw = self.winfo_screenwidth()
-                sh = self.winfo_screenheight()
-                # Sanity-check: window must remain visible (allow small overflow).
-                if -100 < x < sw - 50 and -100 < y < sh - 50:
-                    self.geometry(f"+{x}+{y}")
-                    return
+            if isinstance(x, int) and isinstance(y, int) and self._saved_position_visible(x, y):
+                self.geometry(f"+{x}+{y}")
+                self._fit_window(self)
+                return
         self._place_bottom_right()
 
     def _save_position(self) -> None:
         if not self._settings.get("remember_position", True):
             return
+        self._fit_window(self, refresh=False)
         try:
             self._settings["window_x"] = int(self.winfo_x())
             self._settings["window_y"] = int(self.winfo_y())
             save_settings(self._settings)
         except (OSError, tk.TclError):
             pass
+
+    def _fit_window(self, win: tk.Misc | None, *, refresh: bool = True) -> None:
+        """Pull a window inside the monitor work area, with a margin.
+
+        Uses the monitor under the window so a left, top, or side taskbar and
+        a second monitor are all covered. The taskbar readout is not passed here.
+        """
+        if win is None:
+            return
+        fitting = getattr(self, "_fitting_ids", None)
+        if fitting is None:
+            fitting = set()
+            self._fitting_ids = fitting
+        key = str(win)
+        if key in fitting:
+            return
+        fitting.add(key)
+        try:
+            if not win.winfo_exists():
+                return
+            if refresh:
+                win.update_idletasks()
+                w = max(int(win.winfo_reqwidth()), 1)
+                h = max(int(win.winfo_reqheight()), 1)
+            else:
+                w = int(win.winfo_width())
+                h = int(win.winfo_height())
+                if w < 20 or h < 20:
+                    return
+            x, y = int(win.winfo_x()), int(win.winfo_y())
+            area = work_area_for_rect(x, y, w, h)
+            if area is None:
+                area = (0, 0, int(win.winfo_screenwidth()), int(win.winfo_screenheight()))
+            nx, ny, nw, nh = clamp_to_work_area(x, y, w, h, area)
+            if (nx, ny, nw, nh) == (x, y, w, h):
+                return
+            win.geometry(f"{nw}x{nh}+{nx}+{ny}")
+        except tk.TclError:
+            return
+        finally:
+            fitting.discard(key)
+
+    def _fit_settings(self) -> None:
+        if not self._settings_placed:
+            return
+        self._fit_window(self._settings_win)
+
+    def _finish_layout(self) -> None:
+        if self._destroyed:
+            return
+        self._sync_grok_color_row()
+        self._fit_window(self)
 
     # ── lifecycle ─────────────────────────────────────────────────────────────
 
@@ -2037,6 +2316,7 @@ class UsageWidget(tk.Tk):
 
     def _drag_move(self, e: tk.Event) -> None:
         self.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
+        self._fit_window(self, refresh=False)
 
     # ── pin ───────────────────────────────────────────────────────────────────
 
@@ -2172,12 +2452,14 @@ class UsageWidget(tk.Tk):
             tk.Label(self._body, text="No accounts enabled.\nCheck one in ≡ settings.",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 8), justify="left",
                      wraplength=self._inner_w()).pack(anchor="w")
+            self._finish_layout()
             return
         panel = self._panels.get(self._source)
         if not panel:
             self._last_rows = []
             self._plan = ""
             self._reset_body()
+            self._finish_layout()
             return
         if panel[0] == "ok":
             self._plan = panel[2] if len(panel) > 2 else ""
@@ -2313,11 +2595,17 @@ class UsageWidget(tk.Tk):
             tk.Label(self._body, text="All rows hidden — click ≡ to show some",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 8),
                      wraplength=self._inner_w()).pack(anchor="w")
+        elif (
+            self._source == "grok"
+            and self._grok_color_on()
+            and any(row_kind(r) == "slice" for r in rows)
+        ):
+            self._render_grok_colored(rows, visible)
         else:
             for row in visible:
-                self._add_row(*row)
+                self._add_plain_row(row)
 
-        self.update_idletasks()
+        self._finish_layout()
 
     def _add_plan_header(self, plan: str) -> None:
         """Plan name at the top of the tab, above every meter."""
@@ -2509,7 +2797,7 @@ class UsageWidget(tk.Tk):
             self._readout_style_frame = tk.Frame(opts, bg=BG)
             self._readout_style_frame.pack(fill="x", pady=(4, 0))
             self._render_readout_styles()
-            tk.Label(opts, text="Pick the meter with ○ next to a bar.",
+            tk.Label(opts, text="Pick the meter with ○ next to a row.",
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 7),
                      bd=0, padx=0, pady=0).pack(anchor="w", pady=(3, 0))
 
@@ -2536,6 +2824,7 @@ class UsageWidget(tk.Tk):
             meters.pack(fill="x", pady=(4, 0))
             self._render_style_buttons(meters, READOUT_BAR_METERS,
                                        self._readout_bar_meters(), self._pick_readout_bar_meters)
+        self._fit_settings()
 
     def _render_style_buttons(self, frame: tk.Frame, styles, current: str, pick) -> None:
         for child in frame.winfo_children():
@@ -2601,6 +2890,7 @@ class UsageWidget(tk.Tk):
                 row.pack(fill="x")
         else:
             row.pack_forget()
+        self._fit_settings()
 
     def _set_minimize_on_close(self, enabled: bool) -> str | None:
         self._settings["minimize_on_close"] = bool(enabled)
@@ -2661,12 +2951,14 @@ class UsageWidget(tk.Tk):
                     err_lbl.append(e)
                 else:
                     err_lbl[0].config(text=err)
+                self._fit_settings()
                 return
             state["on"] = new
             box.config(text="☑" if new else "☐")
             if err_lbl:
                 err_lbl[0].destroy()
                 err_lbl.clear()
+            self._fit_settings()
 
         box.bind("<Button-1>", toggle)
         lbl.bind("<Button-1>", toggle)
@@ -2721,9 +3013,11 @@ class UsageWidget(tk.Tk):
             drag["y"] = e.y_root - pop.winfo_y()
         def _dm(e: tk.Event) -> None:
             pop.geometry(f"+{e.x_root - drag['x']}+{e.y_root - drag['y']}")
+            self._fit_window(pop, refresh=False)
         for w in (hdr, title):
             w.bind("<ButtonPress-1>", _ds)
             w.bind("<B1-Motion>", _dm)
+            w.bind("<ButtonRelease-1>", lambda _e: self._fit_window(pop))
 
         tk.Frame(pop, bg=SEPARATOR, height=1).pack(fill="x", padx=6, pady=(0, 4))
 
@@ -2737,20 +3031,26 @@ class UsageWidget(tk.Tk):
         pop.geometry(f"{WIDTH}x{pop.winfo_reqheight()}")
         pop.update_idletasks()
         self._position_settings_window()
+        self._settings_placed = True
+        self._fit_settings()
 
     def _position_settings_window(self) -> None:
-        """Place popup adjacent to widget; fall back through 4 sides, then clamp."""
+        """Place popup adjacent to widget, inside the monitor work area."""
         pop = self._settings_win
         if pop is None or not pop.winfo_exists():
             return
         pop.update_idletasks()
-        pw = pop.winfo_width()  or pop.winfo_reqwidth()
-        ph = pop.winfo_height() or pop.winfo_reqheight()
-        sw = pop.winfo_screenwidth()
-        sh = pop.winfo_screenheight()
+        pw = max(pop.winfo_width(), pop.winfo_reqwidth(), 1)
+        ph = max(pop.winfo_height(), pop.winfo_reqheight(), 1)
         wx, wy = self.winfo_x(), self.winfo_y()
-        ww, wh = self.winfo_width(), self.winfo_height()
+        ww = max(self.winfo_width(), 1)
+        wh = max(self.winfo_height(), 1)
+        area = work_area_for_rect(wx, wy, ww, wh)
+        if area is None:
+            area = (0, 0, pop.winfo_screenwidth(), pop.winfo_screenheight())
         gap = 4
+        left, top, right, bottom = area
+        m = WORK_MARGIN
 
         candidates = [
             (wx - pw - gap, wy),           # left of widget (widget is usually bottom-right)
@@ -2759,18 +3059,18 @@ class UsageWidget(tk.Tk):
             (wx, wy + wh + gap),           # below widget
         ]
         for x, y in candidates:
-            if x >= 0 and y >= 0 and x + pw <= sw and y + ph <= sh:
-                pop.geometry(f"+{x}+{y}")
+            if (x >= left + m and y >= top + m
+                    and x + pw <= right - m and y + ph <= bottom - m):
+                pop.geometry(f"{pw}x{ph}+{x}+{y}")
                 return
-        # No side fit cleanly — clamp the left-of placement.
-        x, y = candidates[0]
-        x = max(0, min(x, sw - pw))
-        y = max(0, min(y, sh - ph))
-        pop.geometry(f"+{x}+{y}")
+        # No side fits cleanly — keep the left-of spot, pulled into the work area.
+        x, y, pw, ph = clamp_to_work_area(*candidates[0], pw, ph, area)
+        pop.geometry(f"{pw}x{ph}+{x}+{y}")
 
     def _close_settings_window(self) -> None:
         pop = self._settings_win
         self._settings_win = None
+        self._settings_placed = False
         if pop is not None:
             try:
                 pop.destroy()
@@ -2873,6 +3173,7 @@ class UsageWidget(tk.Tk):
                      font=("Segoe UI", status_font_size),
                      wraplength=WIDTH - 20, justify="left",
                      bd=0, padx=0, pady=0).pack(anchor="w", pady=(2, 0))
+        self._fit_settings()
 
     def _set_update_state(self, state: str, detail: str = "") -> None:
         self._update_state  = state
@@ -2987,19 +3288,152 @@ class UsageWidget(tk.Tk):
             return f"{day[:3]} {rest}"
         return right
 
-    def _add_row(self, label: str, util: float, sub: str,
-                 time_progress: float | None, day_notches: int | None = None,
-                 reset_when: str = "") -> None:
-        pct        = min(int(util * 100), 100)
-        hidden     = label in self._hidden
-        active_fg  = FG_DIM if hidden else FG
-        active_bar = FG_DIM if hidden else bar_color(util)
-        time_fg    = FG_DIM if hidden else TIME_BAR_FG
+    def _grok_color_on(self) -> bool:
+        return bool(self._settings.get("grok_color_categories", True))
 
-        row = tk.Frame(self._body, bg=BG)
-        row.pack(fill="x", pady=(4, 0))
+    def _build_grok_color_toggle(self) -> None:
+        """Checkbox under the Grok rows, above Refresh. Not packed until that tab is showing."""
+        row = tk.Frame(self, bg=BG)
+        self._grok_color_row = row
+        box = tk.Label(row, text="☑", bg=BG, fg=FG, font=("Segoe UI", 9),
+                       cursor="hand2", bd=0, padx=0, pady=0)
+        box.pack(side="left", padx=(0, 4))
+        lbl = tk.Label(row, text="Color-code categories", bg=BG, fg=FG,
+                       font=("Segoe UI", 8), cursor="hand2",
+                       bd=0, padx=0, pady=0)
+        lbl.pack(side="left")
+        self._grok_color_box = box
+        box.bind("<Button-1>", self._toggle_grok_color)
+        lbl.bind("<Button-1>", self._toggle_grok_color)
+        self._sync_grok_color_box()
 
-        top = tk.Frame(row, bg=BG)
+    def _sync_grok_color_box(self) -> None:
+        box = getattr(self, "_grok_color_box", None)
+        if box is None:
+            return
+        try:
+            box.config(text="☑" if self._grok_color_on() else "☐")
+        except tk.TclError:
+            pass
+
+    def _sync_grok_color_row(self) -> None:
+        row = getattr(self, "_grok_color_row", None)
+        if row is None or not row.winfo_exists():
+            return
+        panel = self._panels.get(self._source)
+        show = (
+            self._source == "grok"
+            and bool(panel) and panel[0] == "ok"
+            and bool(self._last_rows)
+        )
+        if show:
+            self._sync_grok_color_box()
+            # winfo_ismapped is false while the window is withdrawn (tray-only
+            # startup), so use the packer state to show and hide the row.
+            if not row.winfo_manager():
+                row.pack(fill="x", padx=8, pady=(2, 0), before=self._refresh_btn)
+        elif row.winfo_manager():
+            row.pack_forget()
+
+    def _toggle_grok_color(self, _e: tk.Event | None = None) -> None:
+        self._settings["grok_color_categories"] = not self._grok_color_on()
+        try:
+            save_settings(self._settings)
+        except OSError:
+            pass
+        self._sync_grok_color_box()
+        if self._source == "grok" and self._last_rows:
+            self._render(self._last_rows)
+
+    def _add_plain_row(self, row: tuple) -> None:
+        if row_kind(row) == "bot-same":
+            self._add_bot_note(row)
+            return
+        self._add_row(*row[:6])
+
+    def _render_grok_colored(self, rows: list, visible: list) -> None:
+        """Weekly pool as one stacked bar, products as a color legend under it."""
+        shown = {r[0] for r in visible}
+        pool = next((r for r in rows if row_kind(r) == "pool"), None)
+        slices = [r for r in rows if row_kind(r) == "slice"]
+        bots = [r for r in rows if row_kind(r) in ("bot", "bot-same")]
+        others = [r for r in rows if row_kind(r) not in ("pool", "slice", "bot", "bot-same")]
+
+        used: set[str] = set()
+        color_of = {r[0]: grok_slice_color(r[0], used) for r in slices}
+        stack_rows = [r for r in slices if r[0] not in self._hidden]
+        if pool is not None and pool[0] in shown:
+            hidden_pool = pool[0] in self._hidden
+            if stack_rows:
+                widths = stack_fractions(
+                    [r[1] for r in stack_rows], pool[1],
+                    complete=len(stack_rows) == len(slices),
+                )
+                segments = [(w, color_of[r[0]]) for r, w in zip(stack_rows, widths)]
+                if hidden_pool:
+                    segments = [(w, FG_DIM) for w, _c in segments]
+            else:
+                # Every category is hidden: one status-colored fill so the
+                # weekly percent and the bar still describe the same total.
+                fill = FG_DIM if hidden_pool else bar_color(pool[1])
+                segments = [(min(max(pool[1], 0.0), 1.0), fill)]
+            self._add_grok_pool(pool, segments)
+
+        for row in slices:
+            if row[0] in shown:
+                self._add_legend_row(row, color_of[row[0]])
+        for row in bots:
+            if row[0] in shown:
+                self._add_plain_row(row)
+        for row in others:
+            if row[0] in shown:
+                self._add_plain_row(row)
+
+    def _add_grok_pool(self, row: tuple, segments: list[tuple[float, str]]) -> None:
+        label, util, sub, time_progress, day_notches, reset_when = row[:6]
+        hidden = label in self._hidden
+        pct = min(int(util * 100), 100)
+        frame = tk.Frame(self._body, bg=BG)
+        frame.pack(fill="x", pady=(4, 0))
+        self._pack_row_title(
+            frame, label, f"{pct}%",
+            FG_DIM if hidden else bar_color(util),
+        )
+        self._mount_stacked_bar(frame, segments)
+        if time_progress is not None:
+            self._mount_time_bar(
+                frame, time_progress,
+                FG_DIM if hidden else TIME_BAR_FG, day_notches,
+            )
+        self._pack_detail(frame, sub, reset_when)
+
+    def _add_legend_row(self, row: tuple, color: str) -> None:
+        label, util = row[0], row[1]
+        hidden = label in self._hidden
+        pct = min(int(util * 100), 100)
+        frame = tk.Frame(self._body, bg=BG)
+        frame.pack(fill="x", pady=(2, 0))
+        self._pack_row_title(
+            frame, label, f"{pct}%",
+            FG_DIM if hidden else FG,
+            swatch=FG_DIM if hidden else color,
+        )
+
+    def _add_bot_note(self, row: tuple) -> None:
+        """Bot app reading of the same weekly limit. Not a stack segment."""
+        frame = tk.Frame(self._body, bg=BG)
+        frame.pack(fill="x", pady=(2, 0))
+        self._pack_row_title(
+            frame, row[0], "", FG_DIM,
+            label_fg=FG_DIM, suffix="same weekly limit",
+        )
+
+    def _pack_row_title(self, parent: tk.Misc, label: str, right_text: str, right_fg: str,
+                        *, swatch: str | None = None, label_fg: str | None = None,
+                        suffix: str = "") -> None:
+        hidden = label in self._hidden
+        active_fg = FG_DIM if hidden else (label_fg or FG)
+        top = tk.Frame(parent, bg=BG)
         top.pack(fill="x")
 
         if self._manage_mode:
@@ -3009,11 +3443,22 @@ class UsageWidget(tk.Tk):
             box.pack(side="left", padx=(0, 4))
             box.bind("<Button-1>", lambda _e, l=label: self._toggle_hidden(l))
 
+        if swatch:
+            size = 8
+            sq = tk.Canvas(top, width=size, height=size, bg=BG,
+                           highlightthickness=0, bd=0)
+            sq.create_rectangle(0, 0, size, size, fill=swatch, width=0)
+            sq.pack(side="left", padx=(0, 6))
+
         tk.Label(top, text=label, bg=BG, fg=active_fg,
                  font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(side="left")
-        tk.Label(top, text=f"{pct}%", bg=BG, fg=active_bar,
-                 font=("Segoe UI", 8, "bold"),
-                 bd=0, padx=0, pady=0).pack(side="right")
+        if suffix:
+            tk.Label(top, text=suffix, bg=BG, fg=FG_DIM,
+                     font=("Segoe UI", 7), bd=0, padx=0, pady=0).pack(side="left", padx=(6, 0))
+        if right_text:
+            tk.Label(top, text=right_text, bg=BG, fg=right_fg,
+                     font=("Segoe UI", 8, "bold"),
+                     bd=0, padx=0, pady=0).pack(side="right")
 
         if self._manage_mode and self._picker_on():
             picked = self._tray_meter() == (self._source, label)
@@ -3026,7 +3471,68 @@ class UsageWidget(tk.Tk):
             dot.bind("<Button-1>", lambda _e, l=label: self._set_tray_setting(
                 "tray_meter", [self._source, l]))
 
-        # Usage bar
+    def _pack_detail(self, parent: tk.Misc, sub: str, reset_when: str) -> None:
+        if not sub and not reset_when:
+            return
+        tier, detail = self._split_plan(sub)
+        if tier:
+            tk.Label(parent, text=tier, bg=BG, fg=FG_DIM,
+                     font=("Segoe UI", 7), bd=0, padx=0, pady=0,
+                     wraplength=self._inner_w(), justify="left",
+                     ).pack(anchor="w")
+        clock = self._fit_clock(detail, reset_when)
+        if detail or clock:
+            line = tk.Frame(parent, bg=BG)
+            line.pack(fill="x")
+            if clock:
+                tk.Label(line, text=clock, bg=BG, fg=FG_DIM,
+                         font=("Segoe UI", 7),
+                         bd=0, padx=0, pady=0).pack(side="right")
+            if detail:
+                room = self._inner_w()
+                if clock:
+                    room = max(40, room - self._ui_font(7).measure(clock) - 4)
+                tk.Label(line, text=detail, bg=BG, fg=FG_DIM,
+                         font=("Segoe UI", 7),
+                         bd=0, padx=0, pady=0,
+                         wraplength=room, justify="left").pack(side="left")
+
+    def _mount_stacked_bar(self, parent: tk.Misc, segments: list[tuple[float, str]]) -> None:
+        """One bar. Each segment is a product's share of the weekly limit; the rest stays dark."""
+        canvas = tk.Canvas(
+            parent, width=1, height=STACK_H, bg=BAR_BG, highlightthickness=0, bd=0,
+        )
+        canvas.pack(fill="x", pady=(2, 0))
+
+        def redraw(_event: tk.Event | None = None) -> None:
+            canvas.delete("all")
+            width = canvas.winfo_width()
+            if width < 2:
+                return
+            canvas.create_rectangle(0, 0, width, STACK_H, fill=BAR_BG, width=0)
+            x = 0
+            for frac, color in segments:
+                span = round(width * max(frac, 0.0))
+                if span <= 0 or x >= width:
+                    continue
+                x1 = min(width, x + span)
+                canvas.create_rectangle(x, 0, x1, STACK_H, fill=color, width=0)
+                x = x1
+
+        canvas.bind("<Configure>", redraw)
+
+    def _add_row(self, label: str, util: float, sub: str,
+                 time_progress: float | None, day_notches: int | None = None,
+                 reset_when: str = "") -> None:
+        pct = min(int(util * 100), 100)
+        hidden = label in self._hidden
+        active_bar = FG_DIM if hidden else bar_color(util)
+        time_fg = FG_DIM if hidden else TIME_BAR_FG
+
+        row = tk.Frame(self._body, bg=BG)
+        row.pack(fill="x", pady=(4, 0))
+        self._pack_row_title(row, label, f"{pct}%", active_bar)
+
         usage_bar = tk.Frame(row, bg=BAR_BG, height=BAR_H)
         usage_bar.pack(fill="x", pady=(2, 0))
         usage_bar.pack_propagate(False)
@@ -3035,30 +3541,7 @@ class UsageWidget(tk.Tk):
 
         if time_progress is not None:
             self._mount_time_bar(row, time_progress, time_fg, day_notches)
-
-        if sub or reset_when:
-            tier, detail = self._split_plan(sub)
-            if tier:
-                tk.Label(row, text=tier, bg=BG, fg=FG_DIM,
-                         font=("Segoe UI", 7), bd=0, padx=0, pady=0,
-                         wraplength=self._inner_w(), justify="left",
-                         ).pack(anchor="w")
-            clock = self._fit_clock(detail, reset_when)
-            if detail or clock:
-                line = tk.Frame(row, bg=BG)
-                line.pack(fill="x")
-                if clock:
-                    tk.Label(line, text=clock, bg=BG, fg=FG_DIM,
-                             font=("Segoe UI", 7),
-                             bd=0, padx=0, pady=0).pack(side="right")
-                if detail:
-                    room = self._inner_w()
-                    if clock:
-                        room = max(40, room - self._ui_font(7).measure(clock) - 4)
-                    tk.Label(line, text=detail, bg=BG, fg=FG_DIM,
-                             font=("Segoe UI", 7),
-                             bd=0, padx=0, pady=0,
-                             wraplength=room, justify="left").pack(side="left")
+        self._pack_detail(row, sub, reset_when)
 
     def _mount_time_bar(self, parent: tk.Misc, progress: float, fill: str,
                         days: int | None) -> None:
@@ -3122,6 +3605,7 @@ class UsageWidget(tk.Tk):
         )
         btn.pack(fill="x", pady=(8, 0))
         self._ts_lbl.config(text="")
+        self._finish_layout()
 
     def _refresh_account_rows(self) -> None:
         frame = getattr(self, "_accounts_frame", None)
@@ -3131,6 +3615,7 @@ class UsageWidget(tk.Tk):
             child.destroy()
         for name in SOURCE_ORDER:
             self._add_account_row(frame, name)
+        self._fit_settings()
 
     def _add_account_row(self, parent: tk.Misc, name: str) -> None:
         row = tk.Frame(parent, bg=BG)
@@ -3176,6 +3661,7 @@ class UsageWidget(tk.Tk):
                  font=("Segoe UI", 7), wraplength=self._inner_w(),
                  justify="left").pack(anchor="w")
         self._ts_lbl.config(text=time.strftime("Failed %H:%M:%S"))
+        self._finish_layout()
 
 
 def main() -> None:

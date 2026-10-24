@@ -9,12 +9,16 @@ A small always-on-top floating window for Windows that shows your Claude.ai plan
 
 - Always-on-top floating window — drag by the title bar to position
 - Live progress bars colored by usage level (green / orange / red)
+- Grok's weekly limit can instead be one stacked bar: each product is a colored
+  segment, and the same colors repeat in the legend under the bar. **Color-code
+  categories** sits at the bottom of the Grok tab (on by default). Uncheck it for
+  the usual green / orange / red bars. The Claude tab is unchanged
 - Countdown to each limit's reset
 - Click the pin (📌) to toggle always-on-top
 - Click the gear (⚙) to enter manage mode — hide rows you don't care about
 - Hidden-row preferences persist across restarts
 - Tray icon shows live usage as a number, a colored ring, or both. Pick the meter with
-  the dot next to any bar in settings mode; turn it off under ≡ → Tray icon
+  the dot next to any row in settings mode; turn it off under ≡ → Tray icon
 - Optional taskbar readout (off by default): a ring, the percentage and the
   reset countdown on the taskbar just left of the tray. Turn it on under ≡ → Tray icon →
   "Readout on taskbar". Windows has no official way to do this, so it may hide itself
@@ -24,6 +28,11 @@ A small always-on-top floating window for Windows that shows your Claude.ai plan
   Check it to start with no floating window: the tray icon stays, and the taskbar
   readout stays too when that is turned on. Click the tray icon to open the window.
   Unchecking Launch on startup hides Taskbar icon only.
+- The floating window and Settings stay inside the monitor's work area, a few
+  pixels clear of the taskbar. That applies when they open, when their height
+  changes, and when a saved position is restored. A taskbar on any edge is
+  covered, including on a second monitor. The taskbar readout is the exception:
+  it is supposed to sit on the taskbar
 
 ## Requirements
 
@@ -62,6 +71,37 @@ widget picks up the new credentials on its own. If the Grok CLI is not installed
 the tab says so and **Sign in** opens PowerShell to install it
 (`irm https://x.ai/cli/install.ps1 | iex`) and then runs `grok.exe` by its full
 path (`%USERPROFILE%\.grok\bin\grok.exe`).
+
+## Grok rows
+
+Weekly is the whole credit pool for this period (`creditUsagePercent`), with the
+reset countdown under it. The products under it (Grok Bot, Cursor, Voice, Build,
+Chat, Imagine, API, and any other product the account reports) come from
+`productUsage`. They are slices of that same pool: their percents add up to about
+the weekly percent (a point or two of difference is rounding).
+
+With **Color-code categories** checked, Weekly is one bar. Each product is a
+colored segment, and the dark remainder is still unused. Under the bar, each
+product is a legend row: a matching color square, the name, and that product's
+percent. Those rows do not have their own bars. Uncheck **Color-code categories**
+and every Grok row goes back to a single bar in green, orange, or red, based on
+how full it is. Those colors mean the usage level, not which product it is.
+The checkbox is on the Grok tab, under the last row and above Refresh. The
+choice is saved in `%USERPROFILE%\.claude_widget_settings.json`.
+
+**Bot app** is the Grok Bot desktop app's reading of that same weekly limit
+(`GetSandUsageStatus`). When its percent and reset match Weekly, it is not
+another slice of the pool. It starts hidden. Show it from manage mode (≡) and
+it appears as a short note, "same weekly limit", not as its own bar or segment.
+If its reset does not match, it is a separate limit and keeps its own bar and
+countdown.
+
+**On-demand** is spend against a separate dollar cap. **Prepaid** is prepaid
+balance still left. Neither one is part of the weekly stack.
+
+Hide a row from manage mode (≡) and it drops out of the stack and the legend.
+The weekly percent stays the real total. The dot next to a row still picks the
+tray meter.
 
 ## Update
 
