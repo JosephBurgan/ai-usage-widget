@@ -281,12 +281,36 @@ def _ps_quote(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
+def _grok_console_tail() -> str:
+    """Leave the window up so a fast failure can be read, then close on Enter."""
+    return (
+        "Write-Host ''\n"
+        "Write-Host 'Press Enter to close this window.'\n"
+        "[void](Read-Host)\n"
+        "exit\n"
+    )
+
+
 def _open_visible_powershell(script: str) -> bool:
-    """Run script in a new PowerShell window. False if the shell cannot start."""
+    """Run script in a new PowerShell window. False if the shell cannot start.
+
+    -Command is wrong here. CreateProcess quotes the script, PowerShell treats
+    that as a double-quoted string and expands $variables before it runs, and
+    the process exits before Read-Host so the console only flashes.
+    -EncodedCommand carries the script unchanged. -NoExit keeps the window
+    open when PowerShell itself errors before the script starts; the script
+    exits after Enter on the normal path.
+    """
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     try:
         subprocess.Popen(
-            ["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass",
-             "-Command", script],
+            [
+                "powershell.exe",
+                "-NoProfile",
+                "-ExecutionPolicy", "Bypass",
+                "-NoExit",
+                "-EncodedCommand", encoded,
+            ],
             cwd=str(HOME),
             creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0),
         )
@@ -295,42 +319,41 @@ def _open_visible_powershell(script: str) -> bool:
     return True
 
 
-_GROK_PAUSE = (
-    "Write-Host ''; "
-    "Write-Host 'Press Enter to close this window.'; "
-    "[void](Read-Host)"
-)
-
-
 def open_grok_login() -> bool:
     """Open a visible window running `grok login`. False if the CLI is not installed."""
     exe = find_grok_cli()
     if not exe:
         return False
-    return _open_visible_powershell(f"& {_ps_quote(exe)} login; {_GROK_PAUSE}")
+    return _open_visible_powershell(f"& {_ps_quote(exe)} login\n" + _grok_console_tail())
 
 
 def open_grok_install_and_login() -> bool:
-    """Visible PowerShell: official installer, then `grok login`."""
+    """Visible PowerShell: official installer, then `grok login` by full path.
+
+    The installer adds grok to the user PATH, which this window does not have yet.
+    """
     url = _ps_quote(GROK_INSTALL_URL)
     script = (
-        "$ErrorActionPreference = 'Stop'; "
-        "try { "
-        f"irm {url} | iex; "
-        "$bin = if ($env:GROK_BIN_DIR) { $env:GROK_BIN_DIR } "
-        "else { Join-Path $env:USERPROFILE '.grok\\bin' }; "
-        "$grok = Join-Path $bin 'grok.exe'; "
-        "if (-not (Test-Path -LiteralPath $grok)) { "
-        "throw ('Installer finished but ' + $grok + ' was not found.') }; "
-        "& $grok login "
-        "} catch { "
-        "Write-Host ''; "
-        "Write-Host ('Could not sign in: ' + $_.Exception.Message); "
-        "Write-Host 'Install by hand in PowerShell:'; "
-        f"Write-Host ('  irm {url} | iex'); "
-        "Write-Host '  grok login' "
-        "}; "
-        + _GROK_PAUSE
+        "$ErrorActionPreference = 'Stop'\n"
+        "try {\n"
+        "  Write-Host 'Installing the Grok CLI...'\n"
+        f"  irm {url} | iex\n"
+        "  $grok = if ($env:GROK_BIN_DIR) { Join-Path $env:GROK_BIN_DIR 'grok.exe' } "
+        "else { Join-Path $env:USERPROFILE '.grok\\bin\\grok.exe' }\n"
+        "  if (-not (Test-Path -LiteralPath $grok)) {\n"
+        "    throw ('Installer finished but ' + $grok + ' was not found.')\n"
+        "  }\n"
+        "  Write-Host ''\n"
+        "  Write-Host 'Starting Grok sign-in...'\n"
+        "  & $grok login\n"
+        "} catch {\n"
+        "  Write-Host ''\n"
+        "  Write-Host ('Could not sign in: ' + $_.Exception.Message)\n"
+        "  Write-Host 'Install by hand in PowerShell:'\n"
+        "  Write-Host '  irm https://x.ai/cli/install.ps1 | iex'\n"
+        "  Write-Host '  grok login'\n"
+        "}\n"
+        + _grok_console_tail()
     )
     return _open_visible_powershell(script)
 
@@ -2606,17 +2629,12 @@ class UsageWidget(tk.Tk):
 
         get_state: () -> bool
         set_state: (new_value: bool) -> str | None   (returns error or None)
-        indent: left inset, with a bullet, for a child of the row above.
+        indent: left inset for a child of the row above.
         """
         row = tk.Frame(parent, bg=BG)
-        row.pack(fill="x", pady=(2, 0))
+        row.pack(fill="x", pady=(2, 0), padx=(indent, 0))
 
         state = {"on": bool(get_state())}
-
-        if indent:
-            bullet = tk.Label(row, text="•", bg=BG, fg=FG_DIM,
-                              font=("Segoe UI", 8), bd=0, pady=0)
-            bullet.pack(side="left", padx=(indent, 2))
 
         box = tk.Label(row, text="☑" if state["on"] else "☐",
                        bg=BG, fg=FG, font=("Segoe UI", 9),

@@ -55,11 +55,13 @@ picks up the new login on its own.
 
 Grok usage is read from the Grok CLI credentials at `%USERPROFILE%\.grok\auth.json`.
 Being signed in on grok.com in a browser is not enough. If the Grok tab says
-"Not signed in", click **Sign in**: it opens a terminal and runs `grok login`.
-Finish sign-in in that window and the widget picks up the new credentials on its
-own. If the Grok CLI is not installed, the tab says so and **Sign in** opens
-PowerShell to install it (`irm https://x.ai/cli/install.ps1 | iex`) and then run
-`grok login`.
+"Not signed in", click **Sign in**: it opens a PowerShell window and runs
+`grok login`. The window stays open through the sign-in and waits for Enter
+before it closes, including when something fails. Finish sign-in there and the
+widget picks up the new credentials on its own. If the Grok CLI is not installed,
+the tab says so and **Sign in** opens PowerShell to install it
+(`irm https://x.ai/cli/install.ps1 | iex`) and then runs `grok.exe` by its full
+path (`%USERPROFILE%\.grok\bin\grok.exe`).
 
 ## Update
 
