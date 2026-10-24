@@ -20,6 +20,7 @@ import threading
 import time
 import tkinter as tk
 import tkinter.font as tkfont
+from tkinter import colorchooser
 import webbrowser
 from ctypes import wintypes
 from datetime import datetime, timezone
@@ -209,16 +210,16 @@ GROK_PRODUCT_LABELS = {
     "GrokCursor":  "Cursor",
 }
 
-# High-contrast hues for the stacked weekly bar. Off the green / orange / red
-# status palette so those still mean "how full", not "which product".
+# High-contrast hues for the stacked weekly bar. Grok Bot is the main product
+# so it gets green; the rest stay off orange/red so those still mean "how full".
 GROK_SLICE_COLORS = {
     "Chat":     "#4C9AFF",  # blue
     "Voice":    "#E255D0",  # magenta — far from Chat
-    "Grok Bot": "#FF8B3D",  # orange
+    "Grok Bot": "#3DDC84",  # green — the main product
     "Cursor":   "#9B6BFF",  # purple
     "Build":    "#F2C94C",  # yellow
     "Imagine":  "#2ED8C3",  # teal
-    "API":      "#9BE15D",  # lime
+    "API":      "#8FA3BF",  # light gray-blue — distinct from Chat and Grok Bot
 }
 GROK_SLICE_FALLBACK = (
     "#FF6B9D", "#5AD0FF", "#C77DFF", "#FFD166", "#3DDC97", "#FF9F1C", "#7A89FF",
@@ -1229,7 +1230,12 @@ def stack_fractions(parts: list[float], pool: float, *, complete: bool) -> list[
     return [p * scale for p in clean]
 
 
-def grok_slice_color(label: str, used: set[str]) -> str:
+def grok_slice_color(label: str, used: set[str],
+                     custom: dict[str, str] | None = None) -> str:
+    override = (custom or {}).get(label)
+    if isinstance(override, str) and override.startswith("#") and len(override) in (4, 7):
+        used.add(override)
+        return override
     color = GROK_SLICE_COLORS.get(label)
     if color is None or color in used:
         for candidate in GROK_SLICE_FALLBACK:
@@ -1820,6 +1826,7 @@ class UsageWidget(tk.Tk):
         self._login_notice = ""
         self._sync_startup_pref()
         self._seed_hidden()
+        self._migrate_grok_hide_category_rows()
         self._settings_placed = False
         self._refresh_min = self._init_refresh_minutes()
         self._manage_mode = False
@@ -3295,8 +3302,22 @@ class UsageWidget(tk.Tk):
     def _grok_color_on(self) -> bool:
         return bool(self._settings.get("grok_color_categories", True))
 
-    def _grok_show_category_rows(self) -> bool:
-        return bool(self._settings.get("grok_show_category_rows", True))
+    def _grok_hide_category_rows(self) -> bool:
+        return bool(self._settings.get("grok_hide_category_rows", False))
+
+    def _migrate_grok_hide_category_rows(self) -> None:
+        """Invert grok_show_category_rows once: show=False becomes hide=True."""
+        if "grok_hide_category_rows" in self._settings:
+            return
+        if "grok_show_category_rows" not in self._settings:
+            return
+        show = bool(self._settings.get("grok_show_category_rows"))
+        self._settings["grok_hide_category_rows"] = not show
+        del self._settings["grok_show_category_rows"]
+        try:
+            save_settings(self._settings)
+        except OSError:
+            pass
 
     def _add_grok_manage_check(self, parent: tk.Misc, text: str, on_toggle,
                                *, pady: tuple[int, int] = (0, 0)) -> tk.Label:
@@ -3320,7 +3341,7 @@ class UsageWidget(tk.Tk):
         self._grok_color_box = self._add_grok_manage_check(
             wrap, "Color-code categories", self._toggle_grok_color)
         self._grok_cat_box = self._add_grok_manage_check(
-            wrap, "Show category rows", self._toggle_grok_cat_rows, pady=(2, 0))
+            wrap, "Hide category rows", self._toggle_grok_cat_rows, pady=(2, 0))
         self._sync_grok_color_box()
         self._sync_grok_cat_box()
 
@@ -3336,7 +3357,7 @@ class UsageWidget(tk.Tk):
         self._sync_check_box(getattr(self, "_grok_color_box", None), self._grok_color_on())
 
     def _sync_grok_cat_box(self) -> None:
-        self._sync_check_box(getattr(self, "_grok_cat_box", None), self._grok_show_category_rows())
+        self._sync_check_box(getattr(self, "_grok_cat_box", None), self._grok_hide_category_rows())
 
     def _sync_grok_color_row(self) -> None:
         row = getattr(self, "_grok_color_row", None)
@@ -3373,8 +3394,28 @@ class UsageWidget(tk.Tk):
         self._sync_grok_color_box()
 
     def _toggle_grok_cat_rows(self, _e: tk.Event | None = None) -> None:
-        self._persist_grok_flag("grok_show_category_rows", not self._grok_show_category_rows())
+        self._persist_grok_flag("grok_hide_category_rows", not self._grok_hide_category_rows())
         self._sync_grok_cat_box()
+
+    def _pick_grok_category_color(self, label: str, current: str) -> None:
+        result = colorchooser.askcolor(
+            color=current, title=f"{label} color", parent=self)
+        if not result or not result[1]:
+            return
+        chosen = result[1]
+        colors = self._settings.get("grok_category_colors")
+        if not isinstance(colors, dict):
+            colors = {}
+        else:
+            colors = dict(colors)
+        colors[label] = chosen
+        self._settings["grok_category_colors"] = colors
+        try:
+            save_settings(self._settings)
+        except OSError:
+            pass
+        if self._source == "grok" and self._last_rows:
+            self._render(self._last_rows)
 
     def _add_plain_row(self, row: tuple) -> None:
         if row_kind(row) == "bot-same":
@@ -3391,7 +3432,10 @@ class UsageWidget(tk.Tk):
         others = [r for r in rows if row_kind(r) not in ("pool", "slice", "bot", "bot-same")]
 
         used: set[str] = set()
-        color_of = {r[0]: grok_slice_color(r[0], used) for r in slices}
+        custom = self._settings.get("grok_category_colors") or {}
+        if not isinstance(custom, dict):
+            custom = {}
+        color_of = {r[0]: grok_slice_color(r[0], used, custom) for r in slices}
         stack_rows = [r for r in slices if r[0] not in self._hidden]
         if pool is not None and pool[0] in shown:
             hidden_pool = pool[0] in self._hidden
@@ -3410,7 +3454,9 @@ class UsageWidget(tk.Tk):
                 segments = [(min(max(pool[1], 0.0), 1.0), fill)]
             self._add_grok_pool(pool, segments)
 
-        if self._grok_show_category_rows():
+        # Hide only folds the legend while manage mode is closed. The stacked
+        # weekly bar always keeps every (non-hidden) category segment.
+        if self._manage_mode or not self._grok_hide_category_rows():
             for row in slices:
                 if row[0] in shown:
                     self._add_legend_row(row, color_of[row[0]])
@@ -3448,7 +3494,7 @@ class UsageWidget(tk.Tk):
         self._pack_row_title(
             frame, label, f"{pct}%",
             FG_DIM if hidden else FG,
-            swatch=FG_DIM if hidden else color,
+            swatch=color,
         )
 
     def _add_bot_note(self, row: tuple) -> None:
@@ -3477,10 +3523,14 @@ class UsageWidget(tk.Tk):
 
         if swatch:
             size = 8
+            fill = FG_DIM if hidden else swatch
             sq = tk.Canvas(top, width=size, height=size, bg=BG,
                            highlightthickness=0, bd=0)
-            sq.create_rectangle(0, 0, size, size, fill=swatch, width=0)
+            sq.create_rectangle(0, 0, size, size, fill=fill, width=0)
             sq.pack(side="left", padx=(0, 6))
+            if self._manage_mode:
+                sq.configure(cursor="hand2")
+                sq.bind("<Button-1>", lambda _e, l=label, c=swatch: self._pick_grok_category_color(l, c))
 
         tk.Label(top, text=label, bg=BG, fg=active_fg,
                  font=("Segoe UI", 8), bd=0, padx=0, pady=0).pack(side="left")
