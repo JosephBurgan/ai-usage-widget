@@ -209,19 +209,19 @@ GROK_PRODUCT_LABELS = {
     "GrokCursor":  "Cursor",
 }
 
-# Category colors for the stacked weekly bar. Kept off the green / orange / red
+# High-contrast hues for the stacked weekly bar. Off the green / orange / red
 # status palette so those still mean "how full", not "which product".
 GROK_SLICE_COLORS = {
-    "Grok Bot": "#6ea8fe",
-    "Cursor":   "#c084fc",
-    "Voice":    "#2dd4bf",
-    "Build":    "#e8a87c",
-    "Chat":     "#7dd3fc",
-    "Imagine":  "#f472b6",
-    "API":      "#facc15",
+    "Chat":     "#4C9AFF",  # blue
+    "Voice":    "#E255D0",  # magenta — far from Chat
+    "Grok Bot": "#FF8B3D",  # orange
+    "Cursor":   "#9B6BFF",  # purple
+    "Build":    "#F2C94C",  # yellow
+    "Imagine":  "#2ED8C3",  # teal
+    "API":      "#9BE15D",  # lime
 }
 GROK_SLICE_FALLBACK = (
-    "#818cf8", "#fb7185", "#38bdf8", "#e879f9", "#a78bfa", "#22d3ee", "#fdba74",
+    "#FF6B9D", "#5AD0FF", "#C77DFF", "#FFD166", "#3DDC97", "#FF9F1C", "#7A89FF",
 )
 
 
@@ -2113,6 +2113,8 @@ class UsageWidget(tk.Tk):
         if self._manage_mode:
             self._manage_mode = False
             self._gear_btn.config(fg=ACCENT)
+            if self._last_rows:
+                self._render(self._last_rows)
         self.withdraw()
         self._update_tray_icon()
 
@@ -2986,6 +2988,8 @@ class UsageWidget(tk.Tk):
             self._close_settings_window()
         if self._last_rows:
             self._render(self._last_rows)
+        else:
+            self._finish_layout()
 
     def _open_settings_window(self) -> None:
         """Pop a separate Toplevel with the settings UI, clamped on-screen."""
@@ -3291,30 +3295,48 @@ class UsageWidget(tk.Tk):
     def _grok_color_on(self) -> bool:
         return bool(self._settings.get("grok_color_categories", True))
 
-    def _build_grok_color_toggle(self) -> None:
-        """Checkbox under the Grok rows, above Refresh. Not packed until that tab is showing."""
-        row = tk.Frame(self, bg=BG)
-        self._grok_color_row = row
+    def _grok_show_category_rows(self) -> bool:
+        return bool(self._settings.get("grok_show_category_rows", True))
+
+    def _add_grok_manage_check(self, parent: tk.Misc, text: str, on_toggle,
+                               *, pady: tuple[int, int] = (0, 0)) -> tk.Label:
+        row = tk.Frame(parent, bg=BG)
+        row.pack(fill="x", pady=pady)
         box = tk.Label(row, text="☑", bg=BG, fg=FG, font=("Segoe UI", 9),
                        cursor="hand2", bd=0, padx=0, pady=0)
         box.pack(side="left", padx=(0, 4))
-        lbl = tk.Label(row, text="Color-code categories", bg=BG, fg=FG,
+        lbl = tk.Label(row, text=text, bg=BG, fg=FG,
                        font=("Segoe UI", 8), cursor="hand2",
                        bd=0, padx=0, pady=0)
         lbl.pack(side="left")
-        self._grok_color_box = box
-        box.bind("<Button-1>", self._toggle_grok_color)
-        lbl.bind("<Button-1>", self._toggle_grok_color)
-        self._sync_grok_color_box()
+        box.bind("<Button-1>", on_toggle)
+        lbl.bind("<Button-1>", on_toggle)
+        return box
 
-    def _sync_grok_color_box(self) -> None:
-        box = getattr(self, "_grok_color_box", None)
+    def _build_grok_color_toggle(self) -> None:
+        """Manage-mode checkboxes under the Grok rows, above Refresh."""
+        wrap = tk.Frame(self, bg=BG)
+        self._grok_color_row = wrap
+        self._grok_color_box = self._add_grok_manage_check(
+            wrap, "Color-code categories", self._toggle_grok_color)
+        self._grok_cat_box = self._add_grok_manage_check(
+            wrap, "Show category rows", self._toggle_grok_cat_rows, pady=(2, 0))
+        self._sync_grok_color_box()
+        self._sync_grok_cat_box()
+
+    def _sync_check_box(self, box: tk.Label | None, on: bool) -> None:
         if box is None:
             return
         try:
-            box.config(text="☑" if self._grok_color_on() else "☐")
+            box.config(text="☑" if on else "☐")
         except tk.TclError:
             pass
+
+    def _sync_grok_color_box(self) -> None:
+        self._sync_check_box(getattr(self, "_grok_color_box", None), self._grok_color_on())
+
+    def _sync_grok_cat_box(self) -> None:
+        self._sync_check_box(getattr(self, "_grok_cat_box", None), self._grok_show_category_rows())
 
     def _sync_grok_color_row(self) -> None:
         row = getattr(self, "_grok_color_row", None)
@@ -3322,12 +3344,14 @@ class UsageWidget(tk.Tk):
             return
         panel = self._panels.get(self._source)
         show = (
-            self._source == "grok"
+            self._manage_mode
+            and self._source == "grok"
             and bool(panel) and panel[0] == "ok"
             and bool(self._last_rows)
         )
         if show:
             self._sync_grok_color_box()
+            self._sync_grok_cat_box()
             # winfo_ismapped is false while the window is withdrawn (tray-only
             # startup), so use the packer state to show and hide the row.
             if not row.winfo_manager():
@@ -3335,15 +3359,22 @@ class UsageWidget(tk.Tk):
         elif row.winfo_manager():
             row.pack_forget()
 
-    def _toggle_grok_color(self, _e: tk.Event | None = None) -> None:
-        self._settings["grok_color_categories"] = not self._grok_color_on()
+    def _persist_grok_flag(self, key: str, value: bool) -> None:
+        self._settings[key] = value
         try:
             save_settings(self._settings)
         except OSError:
             pass
-        self._sync_grok_color_box()
         if self._source == "grok" and self._last_rows:
             self._render(self._last_rows)
+
+    def _toggle_grok_color(self, _e: tk.Event | None = None) -> None:
+        self._persist_grok_flag("grok_color_categories", not self._grok_color_on())
+        self._sync_grok_color_box()
+
+    def _toggle_grok_cat_rows(self, _e: tk.Event | None = None) -> None:
+        self._persist_grok_flag("grok_show_category_rows", not self._grok_show_category_rows())
+        self._sync_grok_cat_box()
 
     def _add_plain_row(self, row: tuple) -> None:
         if row_kind(row) == "bot-same":
@@ -3379,12 +3410,13 @@ class UsageWidget(tk.Tk):
                 segments = [(min(max(pool[1], 0.0), 1.0), fill)]
             self._add_grok_pool(pool, segments)
 
-        for row in slices:
-            if row[0] in shown:
-                self._add_legend_row(row, color_of[row[0]])
-        for row in bots:
-            if row[0] in shown:
-                self._add_plain_row(row)
+        if self._grok_show_category_rows():
+            for row in slices:
+                if row[0] in shown:
+                    self._add_legend_row(row, color_of[row[0]])
+            for row in bots:
+                if row[0] in shown:
+                    self._add_plain_row(row)
         for row in others:
             if row[0] in shown:
                 self._add_plain_row(row)
