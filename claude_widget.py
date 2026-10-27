@@ -1320,7 +1320,7 @@ def _draw_number_with_sign(draw, n: int, text: str, sizing: str, fill: str) -> N
 # borderless window owned by the taskbar (owned windows always stack above
 # their owner), parked just left of the tray. Anything unexpected and it hides.
 
-READOUT_POLL_MS  = 2000
+READOUT_POLL_MS  = 500    # also how fast the readout gets out of a fullscreen game's way
 READOUT_GAP      = 0
 GWLP_HWNDPARENT  = -8
 HWND_TOPMOST     = -1
@@ -1405,24 +1405,55 @@ def _primary_work_area() -> tuple[int, int, int, int] | None:
     return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
 
 
+def _monitor_info(x: int, y: int, w: int, h: int) -> _MONITORINFO | None:
+    """Full-monitor and work-area rects of the monitor nearest this rect."""
+    hmon = _monitor_from_rect(x, y, w, h, MONITOR_DEFAULTTONEAREST)
+    if not hmon:
+        return None
+    info = _MONITORINFO()
+    info.cbSize = ctypes.sizeof(_MONITORINFO)
+    u32 = ctypes.windll.user32
+    try:
+        u32.GetMonitorInfoW.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
+        u32.GetMonitorInfoW.restype = wintypes.BOOL
+        ok = u32.GetMonitorInfoW(hmon, ctypes.byref(info))
+    except (AttributeError, OSError, ctypes.ArgumentError):
+        ok = False
+    return info if ok else None
+
+
 def work_area_for_rect(x: int, y: int, w: int, h: int) -> tuple[int, int, int, int] | None:
     """Work area of the monitor under this rect. Falls back to the primary."""
-    hmon = _monitor_from_rect(x, y, w, h, MONITOR_DEFAULTTONEAREST)
-    if hmon:
-        info = _MONITORINFO()
-        info.cbSize = ctypes.sizeof(_MONITORINFO)
-        u32 = ctypes.windll.user32
-        try:
-            u32.GetMonitorInfoW.argtypes = (ctypes.c_void_p, ctypes.c_void_p)
-            u32.GetMonitorInfoW.restype = wintypes.BOOL
-            ok = u32.GetMonitorInfoW(hmon, ctypes.byref(info))
-        except (AttributeError, OSError, ctypes.ArgumentError):
-            ok = False
-        if ok:
-            r = info.rcWork
-            if r.right > r.left and r.bottom > r.top:
-                return int(r.left), int(r.top), int(r.right), int(r.bottom)
+    info = _monitor_info(x, y, w, h)
+    if info:
+        r = info.rcWork
+        if r.right > r.left and r.bottom > r.top:
+            return int(r.left), int(r.top), int(r.right), int(r.bottom)
     return _primary_work_area()
+
+
+_SHELL_CLASSES = ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd")
+
+
+def fullscreen_app_on(x: int, y: int, w: int, h: int) -> bool:
+    """True when the foreground window (a game, a video) covers the whole monitor this rect is on."""
+    if sys.platform != "win32":
+        return False
+    u32 = ctypes.windll.user32
+    u32.GetForegroundWindow.restype = wintypes.HWND
+    fg = u32.GetForegroundWindow()
+    if not fg:
+        return False
+    cls = ctypes.create_unicode_buffer(64)
+    u32.GetClassNameW(fg, cls, 64)
+    if cls.value in _SHELL_CLASSES:
+        return False
+    win = _win_rect(fg)
+    info = _monitor_info(x, y, w, h)
+    if not win or not info:
+        return False
+    m = info.rcMonitor
+    return win[0] <= m.left and win[1] <= m.top and win[2] >= m.right and win[3] >= m.bottom
 
 
 def rect_on_monitor(x: int, y: int, w: int, h: int) -> bool | None:
@@ -1586,8 +1617,9 @@ def render_readout_bars(rows: list[Row], w: int, h: int, bg: str):
 class TaskbarReadout:
     """Owns the reparented window. All calls come from the Tk thread."""
 
-    def __init__(self, root: tk.Tk, on_click) -> None:
+    def __init__(self, root: tk.Tk, on_click, on_right_click) -> None:
         self._root = root
+        self._on_right_click = on_right_click
         self._win: tk.Toplevel | None = None
         self._lbl: tk.Label | None = None
         self._photo = None
@@ -1611,12 +1643,18 @@ class TaskbarReadout:
             self.hide()
             return False
         slot = (right - w, y, w, h)
+        # The readout is topmost to stay above the taskbar, which would also put
+        # it over a fullscreen game. Step aside while one has the screen.
+        if fullscreen_app_on(*slot):
+            self.hide()
+            return False
         if self._win is None or not self._win.winfo_exists():
             self._win = tk.Toplevel(self._root)
             self._win.overrideredirect(True)
             self._win.configure(bg=self._bg)
             self._lbl = tk.Label(self._win, bd=0, bg=self._bg, cursor="hand2")
             self._lbl.bind("<Button-1>", lambda _e: self._on_click())
+            self._lbl.bind("<Button-3>", lambda e: self._on_right_click(e.x_root, e.y_root))
             self._win.update_idletasks()
             # The main window may be withdrawn at sign-in. Map this window on
             # its own so the taskbar readout still shows.
@@ -1822,6 +1860,7 @@ class UsageWidget(tk.Tk):
         self._on_top      = True
         self._drag_x      = 0
         self._drag_y      = 0
+        self._dropped_off: set[str] = set()   # windows the user left hanging off-screen
         self._settings    = load_settings()
         self._login_notice = ""
         self._sync_startup_pref()
@@ -1866,7 +1905,7 @@ class UsageWidget(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._setup_tray()
-        self._readout = TaskbarReadout(self, self._show_and_raise)
+        self._readout = TaskbarReadout(self, self._show_and_raise, self._readout_menu)
         self._readout_tick()
         self._show_event = _k32.CreateEventW(None, False, False, SHOW_EVENT)
         self._show_event_tick()
@@ -1939,7 +1978,7 @@ class UsageWidget(tk.Tk):
     def _bind_drag(self, widget: tk.Misc) -> None:
         widget.bind("<ButtonPress-1>",   self._drag_start)
         widget.bind("<B1-Motion>",       self._drag_move)
-        widget.bind("<ButtonRelease-1>", lambda _e: self._save_position())
+        widget.bind("<ButtonRelease-1>", lambda _e: (self._drop(self), self._save_position()))
 
     def _apply_icon(self) -> None:
         icon = REPO_DIR / "claude_widget.ico"
@@ -1994,17 +2033,26 @@ class UsageWidget(tk.Tk):
             y = self._settings.get("window_y")
             if isinstance(x, int) and isinstance(y, int) and self._saved_position_visible(x, y):
                 self.geometry(f"+{x}+{y}")
-                self._fit_window(self)
+                # Left hanging off-screen last time: reopen there, and don't let the
+                # first refresh yank it back. Reset position is the way out.
+                self.update_idletasks()
+                # Rows haven't loaded yet, so use the height it had when saved.
+                saved_h = self._settings.get("window_h")
+                w = max(self.winfo_reqwidth(), 1)
+                h = max(self.winfo_reqheight(), saved_h if isinstance(saved_h, int) else 1)
+                area = work_area_for_rect(x, y, w, h)
+                if area and clamp_to_work_area(x, y, w, h, area) != (x, y, w, h):
+                    self._dropped_off.add(str(self))
                 return
         self._place_bottom_right()
 
     def _save_position(self) -> None:
         if not self._settings.get("remember_position", True):
             return
-        self._fit_window(self, refresh=False)
         try:
             self._settings["window_x"] = int(self.winfo_x())
             self._settings["window_y"] = int(self.winfo_y())
+            self._settings["window_h"] = int(self.winfo_height())
             save_settings(self._settings)
         except (OSError, tk.TclError):
             pass
@@ -2015,7 +2063,7 @@ class UsageWidget(tk.Tk):
         Uses the monitor under the window so a left, top, or side taskbar and
         a second monitor are all covered. The taskbar readout is not passed here.
         """
-        if win is None:
+        if win is None or str(win) in self._dropped_off:
             return
         fitting = getattr(self, "_fitting_ids", None)
         if fitting is None:
@@ -2115,6 +2163,28 @@ class UsageWidget(tk.Tk):
             self._show_and_raise()
         self._after_safe(SHOW_POLL_MS, self._show_event_tick)
 
+    def _readout_menu(self, x: int, y: int) -> None:
+        menu = tk.Menu(self, tearoff=0, bg=BG, fg=FG, activebackground=BTN_BG_HOVER,
+                       activeforeground=FG, bd=0)
+        menu.add_command(label="Reset position", command=self._reset_position)
+        try:
+            menu.tk_popup(x, y)
+        finally:
+            menu.grab_release()
+
+    def _reset_position(self) -> None:
+        """Bring the widget back to the bottom-right corner, fully on-screen."""
+        self._show_and_raise()
+        self._dropped_off.discard(str(self))
+        self.update_idletasks()
+        w = max(self.winfo_width(), self.winfo_reqwidth(), 1)
+        h = max(self.winfo_height(), self.winfo_reqheight(), 1)
+        area = _primary_work_area() or (0, 0, self.winfo_screenwidth(), self.winfo_screenheight())
+        # Clamping a far-off point lands it in the work area's bottom-right corner.
+        x, y, _, _ = clamp_to_work_area(10**6, 10**6, w, h, area)
+        self.geometry(f"+{x}+{y}")
+        self._save_position()
+
     def _hide_window(self) -> None:
         self._close_settings_window()
         if self._manage_mode:
@@ -2196,8 +2266,12 @@ class UsageWidget(tk.Tk):
         def quit_app(icon=None, item=None):
             self._after_safe(0, self._quit_app)
 
+        def reset_position(icon=None, item=None):
+            self._after_safe(0, self._reset_position)
+
         menu = pystray.Menu(
             pystray.MenuItem("Show", show, default=True),
+            pystray.MenuItem("Reset position", reset_position),
             pystray.MenuItem("Hide", hide),
             pystray.MenuItem("Refresh now", refresh_now),
             pystray.Menu.SEPARATOR,
@@ -2324,8 +2398,22 @@ class UsageWidget(tk.Tk):
         self._drag_y = e.y_root - self.winfo_y()
 
     def _drag_move(self, e: tk.Event) -> None:
+        # No clamping mid-drag: fighting the mouse every motion event is what jittered.
         self.geometry(f"+{e.x_root - self._drag_x}+{e.y_root - self._drag_y}")
-        self._fit_window(self, refresh=False)
+
+    def _drop(self, win: tk.Misc) -> None:
+        """A window dropped partly off-screen stays put until it is next opened."""
+        try:
+            x, y = int(win.winfo_x()), int(win.winfo_y())
+            w, h = int(win.winfo_width()), int(win.winfo_height())
+        except tk.TclError:
+            return
+        area = work_area_for_rect(x, y, w, h) or (
+            0, 0, int(win.winfo_screenwidth()), int(win.winfo_screenheight()))
+        if clamp_to_work_area(x, y, w, h, area) == (x, y, w, h):
+            self._dropped_off.discard(str(win))
+        else:
+            self._dropped_off.add(str(win))
 
     # ── pin ───────────────────────────────────────────────────────────────────
 
@@ -3024,11 +3112,10 @@ class UsageWidget(tk.Tk):
             drag["y"] = e.y_root - pop.winfo_y()
         def _dm(e: tk.Event) -> None:
             pop.geometry(f"+{e.x_root - drag['x']}+{e.y_root - drag['y']}")
-            self._fit_window(pop, refresh=False)
         for w in (hdr, title):
             w.bind("<ButtonPress-1>", _ds)
             w.bind("<B1-Motion>", _dm)
-            w.bind("<ButtonRelease-1>", lambda _e: self._fit_window(pop))
+            w.bind("<ButtonRelease-1>", lambda _e: self._drop(pop))
 
         tk.Frame(pop, bg=SEPARATOR, height=1).pack(fill="x", padx=6, pady=(0, 4))
 
@@ -3083,6 +3170,7 @@ class UsageWidget(tk.Tk):
         self._settings_win = None
         self._settings_placed = False
         if pop is not None:
+            self._dropped_off.discard(str(pop))
             try:
                 pop.destroy()
             except tk.TclError:
