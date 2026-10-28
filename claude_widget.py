@@ -8,9 +8,11 @@ are in settings; an unchecked account never gets a tab.
 from __future__ import annotations
 
 import base64
+import bisect
 import ctypes
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -1322,6 +1324,9 @@ def _draw_number_with_sign(draw, n: int, text: str, sizing: str, fill: str) -> N
 
 READOUT_POLL_MS  = 500    # also how fast the readout gets out of a fullscreen game's way
 READOUT_GAP      = 0
+READOUT_HOVER_MS = 100
+READOUT_FRAME_MS = 16     # pointer poll while over the readout, dragging or sliding
+VK_LBUTTON       = 0x01
 GWLP_HWNDPARENT  = -8
 HWND_TOPMOST     = -1
 SWP_NOACTIVATE   = 0x0010
@@ -1617,8 +1622,16 @@ def render_readout_bars(rows: list[Row], w: int, h: int, bg: str):
 class TaskbarReadout:
     """Owns the reparented window. All calls come from the Tk thread."""
 
-    def __init__(self, root: tk.Tk, on_click, on_right_click) -> None:
+    def __init__(self, root: tk.Tk, on_click, on_right_click, tip_for, on_reorder) -> None:
         self._root = root
+        self._on_reorder = on_reorder  # (graph ids, left to right) after a drag
+        self._args: tuple | None = None
+        self._tile_x: dict[str, float] = {}   # where each tile is drawn, mid-slide
+        self._order: list[str] = []           # graph ids as last drawn
+        self._sliding = False
+        self._down = False
+        self._press: tuple[str | None, int] | None = None   # (region, screen x)
+        self._drag: dict | None = None        # id, grab (px into tile), x (strip px)
         self._on_right_click = on_right_click
         self._win: tk.Toplevel | None = None
         self._lbl: tk.Label | None = None
@@ -1628,6 +1641,11 @@ class TaskbarReadout:
         self._bg = "#1c1c1c"
         self._data: tuple | None = None
         self._on_click = on_click
+        self._tip_for = tip_for       # key -> (title, body) or None
+        self._regions: list[tuple[int, int, str]] = []
+        self._hover: str | None = None
+        self._tip: tk.Toplevel | None = None
+        self._hover_after: str | None = None
 
     def _hwnd(self) -> int:
         return ctypes.windll.user32.GetParent(self._win.winfo_id())
@@ -1652,10 +1670,12 @@ class TaskbarReadout:
             self._win = tk.Toplevel(self._root)
             self._win.overrideredirect(True)
             self._win.configure(bg=self._bg)
+            # Left clicks and drags are read in _poll_pointer, which also sees
+            # the see-through pixels.
             self._lbl = tk.Label(self._win, bd=0, bg=self._bg, cursor="hand2")
-            self._lbl.bind("<Button-1>", lambda _e: self._on_click())
             self._lbl.bind("<Button-3>", lambda e: self._on_right_click(e.x_root, e.y_root))
             self._win.update_idletasks()
+            self._poll_pointer()
             # The main window may be withdrawn at sign-in. Map this window on
             # its own so the taskbar readout still shows.
             try:
@@ -1680,9 +1700,10 @@ class TaskbarReadout:
             self._data_drawn = None
         # Tk doesn't always move a reowned window, and clicking the taskbar can
         # raise it over us, so pin the spot and z-order every poll.
-        # A withdrawn main window must not take this readout with it.
+        # A withdrawn main window must not take this readout with it, and a
+        # minimize (screen-control tools do this) would leave a gray "tk" stub.
         try:
-            if str(self._win.state()) == "withdrawn":
+            if str(self._win.state()) in ("withdrawn", "iconic"):
                 self._win.deiconify()
         except tk.TclError:
             pass
@@ -1692,27 +1713,94 @@ class TaskbarReadout:
         u32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)
         return True
 
-    def show(self, rows: list[Row], style: str) -> None:
-        """Ring shows rows[0]; bars stack every row."""
-        label, util, sub = rows[0][0], rows[0][1], rows[0][2]
+    def show(self, rows: list[Row], style: str, graphs: list[tuple] = ()) -> None:
+        """Perf graphs on the left, then usage. Ring shows rows[0]; bars stack every row.
+
+        graphs: (id, color, series) per tile, in saved order. Either side may be empty.
+        """
+        self._args = (rows, style, list(graphs))
+        self._draw()
+
+    def _layout(self, ids: list[str], tile: int) -> dict[str, float]:
+        """Drawn x per tile. The dragged tile follows the mouse; the rest slide
+        toward their slots a share of the way each frame, like taskbar icons."""
+        step = tile + PERF_TILE_GAP
+        drag = self._drag if self._drag and self._drag["id"] in ids else None
+        if drag:
+            ids = [i for i in ids if i != drag["id"]]
+            ids.insert(min(max(round(drag["x"] / step), 0), len(ids)), drag["id"])
+        self._order = ids
+        xs, sliding = {}, False
+        for i, gid in enumerate(ids):
+            target = float(i * step)
+            if drag and gid == drag["id"]:
+                xs[gid] = drag["x"]
+                continue
+            cur = self._tile_x.get(gid, target)
+            cur += (target - cur) * PERF_SLIDE
+            if abs(target - cur) < 0.5:
+                cur = target
+            else:
+                sliding = True
+            xs[gid] = cur
+        self._tile_x, self._sliding = xs, sliding
+        return xs
+
+    def _draw(self) -> None:
+        if self._args is None:
+            return
+        rows, style, graphs = self._args
+        if not rows and not graphs:
+            self.hide()
+            return
         bars = style == "bars"
         try:
             counts = [tray_segments(r) for r in rows]
-            width_for = (lambda h: readout_bars_width(counts, h)) if bars else (
-                lambda h: readout_width(util, label, sub, h))
-            if not self._ensure(width_for):
+
+            def usage_w(h: int) -> int:
+                if not rows:
+                    return 0
+                if bars:
+                    return readout_bars_width(counts, h)
+                return readout_width(rows[0][1], rows[0][0], rows[0][2], h)
+
+            if not self._ensure(lambda h: perf_strip_width(len(graphs), h) + usage_w(h)):
                 return
-            data = (style, self._slot, self._bg, tuple(
-                (r[0], round(r[1], 3), r[2], c, None if r[3] is None else round(r[3], 3))
-                for r, c in zip(rows, counts)))
-            if data == getattr(self, "_data_drawn", None):
-                return
-            from PIL import ImageTk
             _, _, w, h = self._slot
-            if bars:
-                image = render_readout_bars(rows, w, h, self._bg)
-            else:
-                image = render_readout(util, label, sub, w, h, self._bg)
+            gw = perf_strip_width(len(graphs), h)
+            tile = round((h - 2 * READOUT_BARS_PAD) * PERF_TILE_RATIO)
+            xs = self._layout([g[0] for g in graphs], tile)
+            lifted = self._drag["id"] if self._drag else None
+            data = (style, self._slot, self._bg, lifted,
+                    tuple((g, round(x * TRAY_SS)) for g, x in xs.items()), tuple(
+                (r[0], round(r[1], 3), r[2], c, None if r[3] is None else round(r[3], 3))
+                for r, c in zip(rows, counts)), tuple(
+                (gid, color, tuple((tuple(round(v, 3) for v in line), filled, style)
+                                   for line, filled, style in series))
+                for gid, color, series in graphs))
+            if data == getattr(self, "_data_drawn", None):
+                self._refresh_tip()
+                return
+            from PIL import Image, ImageTk
+            image = Image.new("RGB", (w, h), self._bg)
+            regions = []
+            if graphs:
+                # The dragged tile is drawn last so it rides over the others.
+                tiles = sorted(graphs, key=lambda g: g[0] == lifted)
+                image.paste(render_perf_strip(
+                    [(xs[gid], c, s, gid == lifted) for gid, c, s in tiles], gw, h, self._bg))
+                for i, gid in enumerate(self._order):
+                    x = i * (tile + PERF_TILE_GAP)
+                    regions.append((x, x + tile, gid))
+            if rows:
+                uw = w - gw
+                if bars:
+                    part = render_readout_bars(rows, uw, h, self._bg)
+                else:
+                    part = render_readout(rows[0][1], rows[0][0], rows[0][2], uw, h, self._bg)
+                image.paste(part, (gw, 0))
+                regions.append((gw, w, "usage"))
+            self._regions = regions
             self._photo = ImageTk.PhotoImage(image)
             self._lbl.config(image=self._photo, bg=self._bg)
             self._win.configure(bg=self._bg)
@@ -1720,10 +1808,126 @@ class TaskbarReadout:
             # top highlight) shows; edges stay anti-aliased against that color.
             self._win.attributes("-transparentcolor", self._bg)
             self._data_drawn = data
+            self._refresh_tip()
         except Exception:  # noqa: BLE001 — a readout failure must not take the widget down
             self.hide()
 
+    # ── hover tooltip ──
+
+    def _poll_pointer(self) -> None:
+        """Hover, click and drag, polled rather than bound: see-through pixels
+        pass the mouse straight to the taskbar, so Tk never hears about them."""
+        self._hover_after = None
+        if self._win is None:
+            return
+        u32 = ctypes.windll.user32
+        pt = wintypes.POINT()
+        u32.GetCursorPos(ctypes.byref(pt))
+        down = bool(u32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
+        key, inside, sx = None, False, 0
+        if self._slot:
+            sx, sy, w, h = self._slot
+            inside = sx <= pt.x < sx + w and sy <= pt.y < sy + h
+            if inside:
+                key = next((k for x0, x1, k in self._regions if x0 <= pt.x - sx < x1), None)
+
+        if down and not self._down:
+            self._press = (key, pt.x) if inside else None
+        elif down and self._press:
+            pressed, px = self._press
+            if (self._drag is None and pressed not in (None, "usage")
+                    and abs(pt.x - px) > PERF_DRAG_PX):
+                start = next((r[0] for r in self._regions if r[2] == pressed), 0)
+                self._drag = {"id": pressed, "grab": px - sx - start, "x": float(start)}
+                self._set_hover(None)
+            if self._drag and self._slot:
+                tile = round((self._slot[3] - 2 * READOUT_BARS_PAD) * PERF_TILE_RATIO)
+                last = (len(self._order) - 1) * (tile + PERF_TILE_GAP)
+                self._drag["x"] = float(min(max(pt.x - sx - self._drag["grab"], 0), last))
+                self._draw()
+        elif not down and self._down:
+            press, self._press = self._press, None
+            if self._drag:
+                self._drag = None
+                self._on_reorder(list(self._order))
+                self._draw()
+            elif press and press[0] and inside and abs(pt.x - press[1]) <= PERF_DRAG_PX:
+                self._on_click()
+        self._down = down
+
+        if not self._drag:
+            self._set_hover(key)
+            if self._sliding:
+                self._draw()
+        fast = inside or self._down or self._sliding
+        try:
+            self._hover_after = self._root.after(
+                READOUT_FRAME_MS if fast else READOUT_HOVER_MS, self._poll_pointer)
+        except tk.TclError:
+            pass
+
+    def _set_hover(self, key: str | None) -> None:
+        if key != self._hover:
+            self._hover = key
+            self._refresh_tip()
+
+    def _refresh_tip(self) -> None:
+        """Live: called on every redraw, so the numbers tick while hovering."""
+        tip = self._tip_for(self._hover) if self._hover and self._slot else None
+        region = next((r for r in self._regions if r[2] == self._hover), None)
+        if not tip or region is None:
+            self._hide_tip()
+            return
+        title, body = tip
+        if self._tip is None or not self._tip.winfo_exists():
+            t = tk.Toplevel(self._root)
+            t.overrideredirect(True)
+            t.attributes("-topmost", True)
+            t.configure(bg=SEPARATOR)
+            inner = tk.Frame(t, bg=BG)
+            inner.pack(padx=1, pady=1)
+            self._tip_title = tk.Label(inner, bg=BG, fg=FG, font=("Segoe UI", 9, "bold"),
+                                       justify="left", bd=0)
+            self._tip_title.pack(anchor="w", padx=8, pady=(5, 0))
+            self._tip_body = tk.Label(inner, bg=BG, fg=FG, font=("Segoe UI", 8),
+                                      justify="left", bd=0)
+            self._tip_body.pack(anchor="w", padx=8, pady=(1, 6))
+            self._tip = t
+            try:
+                t.deiconify()
+            except tk.TclError:
+                pass
+        if self._tip_title.cget("text") == title and self._tip_body.cget("text") == body:
+            return
+        self._tip_title.config(text=title)
+        self._tip_body.config(text=body)
+        self._tip.update_idletasks()
+        tw, th = self._tip.winfo_reqwidth(), self._tip.winfo_reqheight()
+        sx, sy, _, _ = self._slot
+        x = sx + (region[0] + region[1]) // 2 - tw // 2
+        bar = _win_rect(self._bar) if self._bar else None
+        if bar:
+            x = max(bar[0] + 4, min(x, bar[2] - tw - 4))
+        self._tip.geometry(f"+{x}+{sy - th - 6}")
+
+    def _hide_tip(self) -> None:
+        tip, self._tip = self._tip, None
+        if tip is not None:
+            try:
+                tip.destroy()
+            except tk.TclError:
+                pass
+
     def hide(self) -> None:
+        self._hover, self._regions = None, []
+        self._drag, self._press, self._tile_x = None, None, {}
+        self._hide_tip()
+        if self._hover_after is not None:
+            try:
+                self._root.after_cancel(self._hover_after)
+            except tk.TclError:
+                pass
+            self._hover_after = None
         win, self._win = self._win, None
         self._bar, self._slot, self._data_drawn = 0, None, None
         if win is not None:
@@ -1848,6 +2052,612 @@ def render_tray_icon(util: float, style: str, segments: int = 5,
     return img.resize((TRAY_PX, TRAY_PX), Image.LANCZOS)
 
 
+# ── Performance graphs ───────────────────────────────────────────────────────
+# Task Manager's Performance tiles, read from the same PDH counters it uses.
+
+PERF_SAMPLE_S  = 1.0
+PERF_HISTORY   = 60          # one sample a second, like Task Manager's 60 seconds
+PERF_TILE_RATIO = 1.0        # tile width per px of height
+PERF_TILE_GAP  = 4
+PERF_NET_FLOOR = 1_000       # bits/s, lowest graph top; Task Manager goes this low too
+PERF_NET_FILL  = "#4d192c"   # Task Manager's shade under the receive line
+PERF_COLORS = {             # Task Manager's own where it has one
+    "cpu":  "#39b8e3",
+    "mem":  "#3d7eff",
+    "disk": "#4cc35a",
+    "net":  "#f5628e",
+    "gpu":  "#de68f2",
+}
+PERF_SLIDE     = 0.3         # share of the gap a sliding tile closes each frame
+PERF_DRAG_PX   = 4           # movement before a press becomes a drag
+PERF_POPOUT_POLL_MS = 150
+PERF_POPOUT_SLACK   = 8      # px the mouse may stray past the graph picker
+PERF_COUNTERS = {
+    "cpu":      r"\Processor Information(_Total)\% Processor Utility",
+    "cpu_perf": r"\Processor Information(_Total)\% Processor Performance",
+    "cpu_freq": r"\Processor Information(_Total)\Processor Frequency",
+    "commit":   r"\Memory\Committed Bytes",
+    "commit_limit": r"\Memory\Commit Limit",
+    "standby_n": r"\Memory\Standby Cache Normal Priority Bytes",
+    "standby_r": r"\Memory\Standby Cache Reserve Bytes",
+    "standby_c": r"\Memory\Standby Cache Core Bytes",
+    "modified": r"\Memory\Modified Page List Bytes",
+    "paged":    r"\Memory\Pool Paged Bytes",
+    "nonpaged": r"\Memory\Pool Nonpaged Bytes",
+    "disk_idle": r"\PhysicalDisk(*)\% Idle Time",
+    "disk_read": r"\PhysicalDisk(*)\Disk Read Bytes/sec",
+    "disk_write": r"\PhysicalDisk(*)\Disk Write Bytes/sec",
+    "net_sent": r"\Network Interface(*)\Bytes Sent/sec",
+    "net_recv": r"\Network Interface(*)\Bytes Received/sec",
+    "net_bw":   r"\Network Interface(*)\Current Bandwidth",
+    "gpu_eng":  r"\GPU Engine(*)\Utilization Percentage",
+    "gpu_mem":  r"\GPU Adapter Memory(*)\Dedicated Usage",
+}
+PDH_FMT_DOUBLE   = 0x200
+PDH_FMT_NOCAP100 = 0x8000
+PDH_MORE_DATA    = 0x800007D2 - (1 << 32)
+CREATE_NO_WINDOW = 0x08000000
+# Disk types and adapter names only come from PowerShell. Slow (~4s), so once
+# at start and again when a disk or adapter comes or goes.
+PERF_DISCOVER_PS = (
+    "$d=@(Get-PhysicalDisk|Select-Object DeviceId,MediaType,BusType);"
+    "$n=@(Get-NetAdapter|Where-Object Status -eq Up|"
+    "Select-Object Name,InterfaceDescription,PhysicalMediaType,HardwareInterface);"
+    "@{disks=$d;nets=$n}|ConvertTo-Json -Depth 3 -Compress"
+)
+
+
+class _PdhValue(ctypes.Structure):
+    _fields_ = [("CStatus", wintypes.DWORD), ("doubleValue", ctypes.c_double)]
+
+
+class _PdhItem(ctypes.Structure):
+    _fields_ = [("szName", wintypes.LPWSTR), ("FmtValue", _PdhValue)]
+
+
+class _LUID(ctypes.Structure):
+    _fields_ = [("Low", wintypes.DWORD), ("High", ctypes.c_long)]
+
+
+class _DxgiAdapterDesc1(ctypes.Structure):
+    _fields_ = [("Description", ctypes.c_wchar * 128), ("VendorId", wintypes.UINT),
+                ("DeviceId", wintypes.UINT), ("SubSysId", wintypes.UINT),
+                ("Revision", wintypes.UINT), ("DedicatedVideoMemory", ctypes.c_size_t),
+                ("DedicatedSystemMemory", ctypes.c_size_t),
+                ("SharedSystemMemory", ctypes.c_size_t), ("AdapterLuid", _LUID),
+                ("Flags", wintypes.UINT)]
+
+
+class _KmtOpenLuid(ctypes.Structure):
+    _fields_ = [("AdapterLuid", _LUID), ("hAdapter", wintypes.UINT)]
+
+
+class _KmtQuery(ctypes.Structure):
+    _fields_ = [("hAdapter", wintypes.UINT), ("Type", ctypes.c_int),
+                ("pPrivateDriverData", ctypes.c_void_p), ("PrivateDriverDataSize", wintypes.UINT)]
+
+
+class _KmtPerfData(ctypes.Structure):
+    _fields_ = [("PhysicalAdapterIndex", wintypes.UINT), ("MemoryFrequency", ctypes.c_uint64),
+                ("MaxMemoryFrequency", ctypes.c_uint64), ("MaxMemoryFrequencyOC", ctypes.c_uint64),
+                ("MemoryBandwidth", ctypes.c_uint64), ("PCIEBandwidth", ctypes.c_uint64),
+                ("FanRPM", wintypes.ULONG), ("Power", wintypes.ULONG),
+                ("Temperature", wintypes.ULONG), ("PowerStateOverride", ctypes.c_ubyte)]
+
+
+class _MemStatus(ctypes.Structure):
+    _fields_ = [("dwLength", wintypes.DWORD), ("dwMemoryLoad", wintypes.DWORD),
+                ("ullTotalPhys", ctypes.c_uint64), ("ullAvailPhys", ctypes.c_uint64),
+                ("ullTotalPageFile", ctypes.c_uint64), ("ullAvailPageFile", ctypes.c_uint64),
+                ("ullTotalVirtual", ctypes.c_uint64), ("ullAvailVirtual", ctypes.c_uint64),
+                ("ullAvailExtendedVirtual", ctypes.c_uint64)]
+
+
+KMTQAITYPE_ADAPTERPERFDATA = 62
+DXGI_ADAPTER_FLAG_SOFTWARE = 2
+
+
+def _com_call(obj, idx: int, *args, argtypes=()) -> int:
+    vtbl = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))).contents
+    return ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p, *argtypes)(vtbl[idx])(obj, *args)
+
+
+def _luid_key(luid: _LUID) -> str:
+    return f"luid_0x{luid.High & 0xFFFFFFFF:08x}_0x{luid.Low:08x}"
+
+
+def dxgi_adapters() -> list[tuple[str, int, _LUID]]:
+    """(name, dedicated VRAM bytes, LUID) for each hardware GPU, in Task Manager order."""
+    import uuid
+    iid = (ctypes.c_byte * 16).from_buffer_copy(
+        uuid.UUID("770aae78-f26f-4dba-a829-253c83d1b387").bytes_le)   # IDXGIFactory1
+    factory = ctypes.c_void_p()
+    if ctypes.windll.dxgi.CreateDXGIFactory1(ctypes.byref(iid), ctypes.byref(factory)) != 0:
+        return []
+    out = []
+    try:
+        i = 0
+        while True:
+            adapter = ctypes.c_void_p()
+            if _com_call(factory, 12, i, ctypes.byref(adapter),          # EnumAdapters1
+                         argtypes=(wintypes.UINT, ctypes.c_void_p)) != 0:
+                break
+            desc = _DxgiAdapterDesc1()
+            _com_call(adapter, 10, ctypes.byref(desc), argtypes=(ctypes.c_void_p,))  # GetDesc1
+            _com_call(adapter, 2)                                         # Release
+            if not desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE:
+                luid = _LUID(desc.AdapterLuid.Low, desc.AdapterLuid.High)
+                out.append((desc.Description, int(desc.DedicatedVideoMemory), luid))
+            i += 1
+    finally:
+        _com_call(factory, 2)
+    return out
+
+
+def gpu_temperature(luid: _LUID) -> float | None:
+    """°C from the driver, the same source as Task Manager. None if not reported."""
+    g = ctypes.windll.gdi32
+    opened = _KmtOpenLuid(luid, 0)
+    if g.D3DKMTOpenAdapterFromLuid(ctypes.byref(opened)) != 0:
+        return None
+    try:
+        data = _KmtPerfData()
+        query = _KmtQuery(opened.hAdapter, KMTQAITYPE_ADAPTERPERFDATA,
+                          ctypes.cast(ctypes.byref(data), ctypes.c_void_p), ctypes.sizeof(data))
+        if g.D3DKMTQueryAdapterInfo(ctypes.byref(query)) != 0 or not data.Temperature:
+            return None
+        return data.Temperature / 10
+    finally:
+        g.D3DKMTCloseAdapter(ctypes.byref(wintypes.UINT(opened.hAdapter)))
+
+
+def cpu_name() -> str:
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
+                            r"HARDWARE\DESCRIPTION\System\CentralProcessor\0") as k:
+            return str(winreg.QueryValueEx(k, "ProcessorNameString")[0]).strip()
+    except OSError:
+        return ""
+
+
+def _pdh_instance(desc: str) -> str:
+    """Adapter description as PDH spells its instance name."""
+    return desc.replace("(", "[").replace(")", "]").replace("#", "_").replace("/", "_")
+
+
+def _fmt_bytes(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit in ("B", "KB") else f"{n:.1f} {unit}"
+        n /= 1024
+    return ""
+
+
+def _fmt_gb(n: float) -> str:
+    return f"{n / 1024 ** 3:.1f}"
+
+
+def _fmt_bits(bps: float) -> str:
+    """Task Manager style: 0 Kbps, 48.0 Kbps, 1.2 Mbps."""
+    for unit, size in (("Gbps", 1e9), ("Mbps", 1e6)):
+        if bps >= size:
+            return f"{bps / size:.3g} {unit}"
+    kbps = bps / 1e3
+    return f"{kbps:.0f} Kbps" if kbps >= 100 or kbps == 0 else f"{kbps:.1f} Kbps"
+
+
+def _disk_kind(media: str, bus: str) -> str:
+    if bus == "USB":
+        return "USB (USB)"
+    media = media if media in ("SSD", "HDD") else ""
+    return f"{media} ({bus})" if media and bus else media or bus
+
+
+def perf_default_on(dev: dict) -> bool:
+    if dev["kind"] in ("cpu", "mem"):
+        return True
+    if dev["kind"] == "net":
+        return bool(dev.get("hw"))
+    return dev["id"] == "gpu:0"
+
+
+class PerfMonitor:
+    """Samples every device once a second on its own thread.
+
+    Devices are dicts: id, kind, title, sub. Tk reads snapshot() only.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._devices: list[dict] = []
+        self._history: dict[str, list] = {}
+        self._tips: dict[str, tuple[str, str]] = {}
+        self._discovered: dict | None = None
+        self._discovering = False
+        self._instances: tuple = ()
+        self.devices_version = 0
+        self.seq = 0
+
+    def running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def start(self) -> None:
+        if self.running() or sys.platform != "win32":
+            return
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, args=(self._stop,), daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread = None
+        with self._lock:
+            self._history.clear()
+
+    def snapshot(self) -> tuple[list[dict], dict[str, list], dict[str, tuple[str, str]]]:
+        with self._lock:
+            return (list(self._devices), {k: list(v) for k, v in self._history.items()},
+                    dict(self._tips))
+
+    def _discover(self) -> None:
+        try:
+            out = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", PERF_DISCOVER_PS],
+                capture_output=True, text=True, timeout=60, creationflags=CREATE_NO_WINDOW)
+            raw = json.loads(out.stdout or "{}")
+        except (OSError, subprocess.SubprocessError, ValueError):
+            raw = {}
+        disks = {str(d.get("DeviceId")): _disk_kind(str(d.get("MediaType") or ""),
+                                                    str(d.get("BusType") or ""))
+                 for d in raw.get("disks") or [] if isinstance(d, dict)}
+        nets = {}
+        for n in raw.get("nets") or []:
+            if isinstance(n, dict) and n.get("InterfaceDescription"):
+                nets[_pdh_instance(str(n["InterfaceDescription"]))] = n
+        self._discovered = {"disks": disks, "nets": nets, "gpus": dxgi_adapters()}
+        self._discovering = False
+
+    def _rediscover(self) -> None:
+        if not self._discovering:
+            self._discovering = True
+            threading.Thread(target=self._discover, daemon=True).start()
+
+    def _run(self, stop: threading.Event) -> None:
+        pdh = ctypes.windll.pdh
+        pdh.PdhGetFormattedCounterArrayW.restype = ctypes.c_long
+        query = ctypes.c_void_p()
+        if pdh.PdhOpenQueryW(None, None, ctypes.byref(query)) != 0:
+            return
+        counters = {}
+        for key, path in PERF_COUNTERS.items():
+            h = ctypes.c_void_p()
+            if pdh.PdhAddEnglishCounterW(query, path, None, ctypes.byref(h)) == 0:
+                counters[key] = h
+        cpu = cpu_name()
+
+        def read(key: str) -> dict[str, float]:
+            h = counters.get(key)
+            if h is None:
+                return {}
+            size, count = wintypes.DWORD(0), wintypes.DWORD(0)
+            fmt = PDH_FMT_DOUBLE | PDH_FMT_NOCAP100
+            if pdh.PdhGetFormattedCounterArrayW(h, fmt, ctypes.byref(size), ctypes.byref(count),
+                                                None) != PDH_MORE_DATA:
+                return {}
+            buf = (ctypes.c_byte * size.value)()
+            if pdh.PdhGetFormattedCounterArrayW(h, fmt, ctypes.byref(size), ctypes.byref(count),
+                                                buf) != 0:
+                return {}
+            items = ctypes.cast(buf, ctypes.POINTER(_PdhItem))
+            return {items[i].szName: items[i].FmtValue.doubleValue
+                    for i in range(count.value) if items[i].FmtValue.CStatus in (0, 1)}
+
+        def one(key: str) -> float:
+            vals = read(key)
+            return next(iter(vals.values()), 0.0)
+
+        try:
+            pdh.PdhCollectQueryData(query)
+            while not stop.wait(PERF_SAMPLE_S):
+                if pdh.PdhCollectQueryData(query) != 0:
+                    continue
+                try:
+                    self._sample(read, one, cpu)
+                except Exception:  # noqa: BLE001 — one bad sample must not end the graphs
+                    pass
+        finally:
+            pdh.PdhCloseQuery(query)
+
+    def _sample(self, read, one, cpu: str) -> None:
+        devices: list[dict] = []
+        values: dict[str, object] = {}
+        tips: dict[str, tuple[str, str]] = {}
+        found = self._discovered or {}
+
+        # CPU
+        util = min(one("cpu"), 100.0)
+        ghz = one("cpu_freq") * one("cpu_perf") / 100 / 1000
+        devices.append({"id": "cpu", "kind": "cpu", "title": "CPU", "sub": cpu})
+        values["cpu"] = util / 100
+        tips["cpu"] = ("CPU", "\n".join(filter(None, [
+            cpu, f"{util:.0f}%  {ghz:.2f} GHz" if ghz else f"{util:.0f}%"])))
+
+        # Memory
+        ms = _MemStatus()
+        ms.dwLength = ctypes.sizeof(ms)
+        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(ms))
+        total, used = ms.ullTotalPhys, ms.ullTotalPhys - ms.ullAvailPhys
+        pct = used / total if total else 0.0
+        cached = sum(one(k) for k in ("standby_n", "standby_r", "standby_c", "modified"))
+        devices.append({"id": "mem", "kind": "mem", "title": "Memory", "sub": ""})
+        values["mem"] = pct
+        tips["mem"] = ("Memory", "\n".join([
+            f"{_fmt_gb(used)}/{_fmt_gb(total)} GB ({pct * 100:.0f}%)",
+            f"Available  {_fmt_gb(ms.ullAvailPhys)} GB",
+            f"Committed  {_fmt_gb(one('commit'))}/{_fmt_gb(one('commit_limit'))} GB",
+            f"Cached  {_fmt_gb(cached)} GB",
+            f"Paged pool  {_fmt_gb(one('paged'))} GB   Non-paged  {_fmt_gb(one('nonpaged'))} GB",
+        ]))
+
+        # Disks: instances look like "3 C:" or "0 D: E:"
+        idle, rd, wr = read("disk_idle"), read("disk_read"), read("disk_write")
+        disks = sorted((k for k in idle if k != "_Total" and k.split()[0].isdigit()),
+                       key=lambda k: int(k.split()[0]))
+        for inst in disks:
+            num, *letters = inst.split()
+            did = f"disk:{num}"
+            title = f"Disk {num} ({', '.join(letters)})" if letters else f"Disk {num}"
+            kind = found.get("disks", {}).get(num, "")
+            active = min(max(100 - idle[inst], 0.0), 100.0)
+            devices.append({"id": did, "kind": "disk", "title": title, "sub": kind})
+            values[did] = active / 100
+            tips[did] = (title, "\n".join(filter(None, [
+                kind, f"Active time  {active:.0f}%",
+                f"Read  {_fmt_bytes(rd.get(inst, 0))}/s   Write  {_fmt_bytes(wr.get(inst, 0))}/s"])))
+
+        # Network: only adapters Windows says are up, like Task Manager.
+        sent, recv, bw = read("net_sent"), read("net_recv"), read("net_bw")
+        for inst in sorted(sent):
+            nic = found.get("nets", {}).get(inst)
+            if not nic:
+                continue
+            name = str(nic.get("Name") or inst)
+            media = str(nic.get("PhysicalMediaType") or "")
+            title = "Wi-Fi" if "802.11" in media or "Wireless" in media else "Ethernet"
+            nid = f"net:{name}"
+            s, r = sent[inst] * 8, recv.get(inst, 0.0) * 8
+            devices.append({"id": nid, "kind": "net", "title": title, "sub": name,
+                            "hw": bool(nic.get("HardwareInterface"))})
+            values[nid] = (s, r)
+            link = bw.get(inst, 0.0)
+            tips[nid] = (title, "\n".join(filter(None, [
+                name, f"S: {_fmt_bits(s)}   R: {_fmt_bits(r)}",
+                str(nic.get("InterfaceDescription") or ""),
+                f"Link speed  {_fmt_bits(link)}" if link else ""])))
+
+        # GPU: Task Manager's number is the busiest engine type, summed over processes.
+        engines: dict[str, dict[str, float]] = {}
+        for inst, v in read("gpu_eng").items():
+            luid_at, eng_at = inst.find("luid_"), inst.find("engtype_")
+            if luid_at < 0 or eng_at < 0:
+                continue
+            luid = inst[luid_at:luid_at + 26].lower()
+            eng = inst[eng_at + 8:]
+            per = engines.setdefault(luid, {})
+            per[eng] = per.get(eng, 0.0) + v
+        vram_used = {k[:26].lower(): v for k, v in read("gpu_mem").items()}
+        for idx, (name, vram, luid) in enumerate(
+                g for g in found.get("gpus", []) if _luid_key(g[2]) in vram_used):
+            key = _luid_key(luid)
+            gid = f"gpu:{idx}"
+            util = min(max(engines.get(key, {}).values(), default=0.0), 100.0)
+            temp = gpu_temperature(luid)
+            title = f"GPU {idx}"
+            devices.append({"id": gid, "kind": "gpu", "title": title, "sub": name})
+            values[gid] = util / 100
+            tips[gid] = (title, "\n".join(filter(None, [
+                name, f"{util:.0f}%" + (f" ({temp:.0f} °C)" if temp is not None else ""),
+                f"Dedicated memory  {_fmt_gb(vram_used.get(key, 0))}/{_fmt_gb(vram)} GB"
+                if vram else ""])))
+
+        instances = (tuple(disks), tuple(sorted(sent)), tuple(sorted(vram_used)))
+        if self._discovered is None or instances != self._instances:
+            self._instances = instances
+            self._rediscover()
+
+        with self._lock:
+            if [d["id"] for d in devices] != [d["id"] for d in self._devices]:
+                self.devices_version += 1
+            self._devices = devices
+            self._tips = tips
+            for did, v in values.items():
+                hist = self._history.setdefault(did, [])
+                hist.append(v)
+                del hist[:-PERF_HISTORY]
+            for did in set(self._history) - set(values):
+                del self._history[did]
+            self.seq += 1
+
+
+def _net_scale(peak: float) -> float:
+    """Task Manager's graph top: the next 1 or 5 step at or above the peak
+    (1, 5, 10, 50 Kbps ... 1, 5 Mbps), so spikes keep headroom."""
+    top = PERF_NET_FLOOR
+    while top < peak:
+        top *= 5 if str(int(top))[0] == "1" else 2
+    return float(top)
+
+
+# Task Manager's flat line, (graph top in bits/s, height), measured off its
+# thumbnail. It only moves when the scale does, sinking as the scale grows.
+PERF_NET_REF = ((5e5, 0.920), (1e6, 0.807), (5e6, 0.761), (1e7, 0.716),
+                (5e7, 0.602), (1e8, 0.511), (5e8, 0.466), (1e9, 0.398))
+
+
+def _net_ref(top: float) -> float:
+    """Height of Task Manager's flat line on a graph topped at top, between
+    the measured points by log scale, continuing their slope past either end."""
+    pts = [(math.log10(t), h) for t, h in PERF_NET_REF]
+    x = math.log10(max(top, 1.0))
+    i = min(max(bisect.bisect_right([p[0] for p in pts], x) - 1, 0), len(pts) - 2)
+    (ax, ah), (bx, bh) = pts[i], pts[i + 1]
+    return min(max(ah + (bh - ah) * (x - ax) / (bx - ax), 0.0), 1.0)
+
+
+def perf_series(kind: str, hist: list) -> list[tuple[tuple[float, ...], bool, str]]:
+    """(values 0..1, filled, style) per line. style "" is a plain 1 px line;
+    "solid" and "dashed" are anti-aliased like Task Manager's network graph.
+
+    Network matches Task Manager: receive solid over a fill, send dashed one
+    px on, one off, both on one scale, plus its flat reference line.
+    """
+    if kind != "net":
+        return [(tuple(min(max(float(v), 0.0), 1.0) for v in hist), True, "")]
+    top = _net_scale(max([0.0] + [max(s, r) for s, r in hist]))
+    return [(tuple(r / top for _s, r in hist), True, "solid"),
+            (tuple(s / top for s, _r in hist), False, "dashed"),
+            ((_net_ref(top),) * PERF_HISTORY, False, "solid")]
+
+
+def _dashes(pts: list[tuple[float, float]], on: float = 1.0, off: float = 1.0):
+    """Split a path into its dashes, measured along the path from its start."""
+    run = [0.0]
+    for (ax, ay), (bx, by) in zip(pts, pts[1:]):
+        run.append(run[-1] + math.hypot(bx - ax, by - ay))
+
+    def at(s: float) -> tuple[float, float]:
+        i = min(max(bisect.bisect_right(run, s) - 1, 0), len(pts) - 2)
+        seg = run[i + 1] - run[i]
+        t = (s - run[i]) / seg if seg else 0.0
+        return (pts[i][0] + (pts[i + 1][0] - pts[i][0]) * t,
+                pts[i][1] + (pts[i + 1][1] - pts[i][1]) * t)
+
+    out, a = [], 0.0
+    while a < run[-1]:
+        b = min(a + on, run[-1])
+        inner = [pts[i] for i in range(len(pts)) if a < run[i] < b]
+        out.append([at(a)] + inner + [at(b)])
+        a += on + off
+    return out
+
+
+def _aa_path(img, box: tuple[int, int, int, int], pts: list[tuple[float, float]],
+             color: str, dashed: bool) -> None:
+    """A 1 px anti-aliased line clipped to box, the way Direct2D draws Task
+    Manager's network lines. The dash phase walks with the path, so a scrolling
+    send line flickers between dotted and an even half-bright line, as there."""
+    from PIL import Image, ImageDraw
+
+    k = 8
+    bx0, by0, bx1, by1 = box
+    mask = Image.new("L", ((bx1 - bx0) * k, (by1 - by0) * k), 0)
+    d = ImageDraw.Draw(mask)
+    # Each segment is filled as its own 1 px band. PIL fills polygon edges
+    # inclusively, so pulling the band in half a subpixel gives true coverage.
+    trim = 0.5 / k
+    for part in (_dashes(pts) if dashed else [pts]):
+        for (ax, ay), (bx, by) in zip(part, part[1:]):
+            seg = math.hypot(bx - ax, by - ay)
+            if seg < 1e-6:
+                continue
+            ux, uy = (bx - ax) / seg, (by - ay) / seg
+            nx, ny = -uy * (0.5 - trim), ux * (0.5 - trim)
+            ex, ey = bx - ux * trim, by - uy * trim
+            d.polygon([((x - bx0) * k, (y - by0) * k) for x, y in (
+                (ax + nx, ay + ny), (ex + nx, ey + ny), (ex - nx, ey - ny), (ax - nx, ay - ny))],
+                fill=255)
+    # Direct2D's anti-aliasing has 32 levels.
+    cover = mask.resize((bx1 - bx0, by1 - by0), Image.BOX).point(
+        lambda v: round(v * 32 / 255) * 255 // 32)
+    img.paste(color, box, cover)
+
+
+def perf_strip_width(count: int, h: int) -> int:
+    if not count:
+        return 0
+    tile = round((h - 2 * READOUT_BARS_PAD) * PERF_TILE_RATIO)
+    return count * tile + (count - 1) * PERF_TILE_GAP + READOUT_BARS_PAD
+
+
+def _mix(a: str, b: str, amount: float) -> str:
+    """Blend a toward b by amount (0..1)."""
+    pa = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+    pb = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    return "#" + "".join(f"{round(x + (y - x) * amount):02x}" for x, y in zip(pa, pb))
+
+
+def render_perf_strip(graphs: list[tuple], w: int, h: int, bg: str):
+    """Task Manager tiles, each (x, color, series, lifted). Newest sample on the right edge.
+
+    Only the graph is colored. The tile is see-through (bg is the readout's
+    transparent color) inside a faint neutral outline. x is fractional px so
+    tiles can slide; a lifted tile (being dragged) gets a brighter outline.
+    """
+    from PIL import Image, ImageDraw
+
+    s, pad = TRAY_SS, READOUT_BARS_PAD
+    img = Image.new("RGB", (w * s, h * s), bg)
+    d = ImageDraw.Draw(img)
+    ch = h - 2 * pad
+    tile = round(ch * PERF_TILE_RATIO)
+    shade = _mix(bg, "#000000", 0.3)
+    outline = _mix(shade, "#ffffff", 0.16)
+    # Lines go on after the shrink: crisp 1px like Task Manager, no smear.
+    lines: list[tuple[list[tuple[float, float]], str, str, tuple[int, int, int, int]]] = []
+    for x, color, series, lifted in graphs:
+        x0, y0 = round(x * s), pad * s
+        x1, y1 = x0 + tile * s - 1, (pad + ch) * s - 1
+        if lifted:
+            d.rectangle((x0, y0, x1, y1), fill=shade)   # covers the tile it rides over
+        step = (x1 - x0) / (PERF_HISTORY - 1)
+        # Inside the outline. Task Manager puts the top on the centre of the top
+        # row and 0 a px below the bottom, so idle lines vanish; its
+        # oldest/newest points sit a quarter px in, and a flat line on one row.
+        box = (math.ceil(x0 / s) + 1, pad + 1, (x1 + 1) // s - 1, pad + ch - 1)
+        span = (box[2] - box[0] - 0.5) / (PERF_HISTORY - 1)
+        for line, filled, style in series:
+            if len(line) < 2:
+                continue
+            if style:
+                ys = [box[3] + 1 - min(max(v, 0.0), 1.0) * (box[3] - box[1] + 0.5)
+                      for v in line]
+                if style == "solid" and not filled and len(set(line)) == 1:
+                    ys = [round(box[3] - 0.5 - line[0] * (box[3] - box[1])) + 0.5] * len(line)
+                xs = [box[2] - 0.25 - (len(line) - 1 - i) * span for i in range(len(line))]
+                if len(set(line)) > 1:
+                    xs = [math.floor(x) + 0.5 for x in xs]   # samples on pixel centres
+                pts = list(zip(xs, ys))
+                if filled:
+                    d.polygon([(px * s, py * s) for px, py in pts]
+                              + [(box[2] * s, pts[-1][1] * s), (box[2] * s, box[3] * s),
+                                 (pts[0][0] * s, box[3] * s)],
+                              fill=PERF_NET_FILL)
+                lines.append((pts, color, style, box))
+                continue
+            pts = [(x1 - (len(line) - 1 - i) * step, y1 - v * (y1 - y0))
+                   for i, v in enumerate(line)]
+            if filled:
+                d.polygon(pts + [(pts[-1][0], y1), (pts[0][0], y1)],
+                          fill=_mix(shade if lifted else bg, color, 0.3))
+            left, right = x0 / s + 1, (x1 + 1) / s - 2         # just inside the outline
+            bottom = (y1 + 1) / s - 2
+            lines.append(([(min(max(px / s, left), right), min(max(py / s, pad + 1), bottom))
+                           for px, py in pts], color, "", box))
+        d.rectangle((x0, y0, x1, y1), outline=_tint(outline, 0.45) if lifted else outline,
+                    width=s)
+    img = img.resize((w, h), Image.BOX)
+    d = ImageDraw.Draw(img)
+    for pts, color, style, box in lines:
+        if style:
+            _aa_path(img, box, pts, color, style == "dashed")
+        else:
+            d.line(pts, fill=color, width=1)
+    return img
+
+
 class UsageWidget(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
@@ -1886,6 +2696,8 @@ class UsageWidget(tk.Tk):
         # Settings popup (created on demand when ≡ pressed)
         self._settings_win: tk.Toplevel | None = None
         self._accounts_frame: tk.Frame | None = None
+        self._perf_popout: tk.Toplevel | None = None
+        self._perf_popout_body: tk.Frame | None = None
 
         # Tray state
         self._tray = None  # set by _setup_tray if pystray is available
@@ -1905,7 +2717,11 @@ class UsageWidget(tk.Tk):
 
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._setup_tray()
-        self._readout = TaskbarReadout(self, self._show_and_raise, self._readout_menu)
+        self._perf = PerfMonitor()
+        self._perf_devices_drawn = -1
+        self._readout_rows: list[Row] = []
+        self._readout = TaskbarReadout(self, self._show_and_raise, self._readout_menu,
+                                       self._readout_tip, self._perf_reorder)
         self._readout_tick()
         self._show_event = _k32.CreateEventW(None, False, False, SHOW_EVENT)
         self._show_event_tick()
@@ -2101,7 +2917,12 @@ class UsageWidget(tk.Tk):
     def _fit_settings(self) -> None:
         if not self._settings_placed:
             return
-        self._fit_window(self._settings_win)
+        # Opened at a fixed height; grow or shrink with rows shown later.
+        pop = self._settings_win
+        if pop is not None and pop.winfo_exists():
+            pop.update_idletasks()
+            pop.geometry(f"{WIDTH}x{pop.winfo_reqheight()}")
+        self._fit_window(pop)
 
     def _finish_layout(self) -> None:
         if self._destroyed:
@@ -2325,25 +3146,182 @@ class UsageWidget(tk.Tk):
 
     def _update_readout(self) -> None:
         row = self._tray_row() if self._readout_on() else None
-        if row is None:
-            self._readout.hide()
-            return
         style = self._readout_style()
-        rows = [row]
-        if style == "bars":
+        rows = [row] if row else []
+        if row and style == "bars":
             panel = self._panels.get(self._tray_meter()[0])
             by_label = {r[0]: r for r in panel[1]} if panel and panel[0] == "ok" else {}
             meters = self._readout_bar_meters()
             labels = READOUT_STACK if meters == "both" else (meters,)
             if all(label in by_label for label in labels):
                 rows = [by_label[label] for label in labels]
-        self._readout.show(rows, style)
+        self._readout_rows = rows
+        self._readout.show(rows, style, self._perf_graphs())
 
     def _readout_tick(self) -> None:
         if self._destroyed:
             return
+        if self._perf_on():
+            self._perf.start()
+        elif self._perf.running():
+            self._perf.stop()
+        if self._perf.devices_version != self._perf_devices_drawn:
+            self._render_perf_devices()
         self._update_readout()
         self._after_safe(READOUT_POLL_MS, self._readout_tick)
+
+    def _readout_tip(self, key: str) -> tuple[str, str] | None:
+        if key != "usage":
+            return self._perf.snapshot()[2].get(key)
+        rows = self._readout_rows
+        if not rows:
+            return None
+        source = SOURCE_TITLE.get(self._tray_meter()[0], "")
+        lines = []
+        for r in rows:
+            when = r[2]
+            if len(r) > 5 and r[5]:
+                when = f"{when} ({r[5]})" if when else r[5]
+            lines.append(f"{r[0]}  {min(int(r[1] * 100), 100)}%" + (f"\n{when}" if when else ""))
+        return source, "\n".join(lines)
+
+    # ── performance graphs ──
+
+    def _perf_on(self) -> bool:
+        return bool(self._settings.get("perf_graphs", True))
+
+    def _perf_picked(self, dev: dict) -> bool:
+        picks = self._settings.get("perf_picks")
+        picks = picks if isinstance(picks, dict) else {}
+        return bool(picks.get(dev["id"], perf_default_on(dev)))
+
+    def _perf_graphs(self) -> list[tuple]:
+        if not self._perf_on() or not self._perf.running():
+            return []
+        devices, history, _ = self._perf.snapshot()
+        order = self._settings.get("perf_order")
+        rank = {gid: i for i, gid in enumerate(order if isinstance(order, list) else [])}
+        # Graphs never dragged keep Task Manager's order, after the dragged ones.
+        picked = sorted((d for d in devices if self._perf_picked(d)),
+                        key=lambda d: rank.get(d["id"], len(rank)))
+        return [(d["id"], PERF_COLORS[d["kind"]], perf_series(d["kind"], history.get(d["id"], [])))
+                for d in picked]
+
+    def _perf_reorder(self, ids: list[str]) -> None:
+        """Save a dragged order. Shown graphs trade places among their own saved
+        slots; unshown or not-yet-found ones keep theirs."""
+        old = self._settings.get("perf_order")
+        old = [i for i in old if isinstance(i, str)] if isinstance(old, list) else []
+        shown = set(ids)
+        merged = old + [i for i in ids if i not in old]
+        dragged = iter(ids)
+        self._set_tray_setting("perf_order", [next(dragged) if i in shown else i for i in merged])
+
+    def _set_perf_on(self, on: bool) -> str | None:
+        err = self._set_tray_setting("perf_graphs", bool(on))
+        self._sync_perf_devices_row()
+        return err
+
+    def _set_perf_pick(self, dev_id: str, on: bool) -> str | None:
+        picks = self._settings.get("perf_picks")
+        picks = dict(picks) if isinstance(picks, dict) else {}
+        picks[dev_id] = bool(on)
+        return self._set_tray_setting("perf_picks", picks)
+
+    def _sync_perf_devices_row(self) -> None:
+        """The graph picker sits on the on/off row, only while graphs are on."""
+        btn = getattr(self, "_perf_pick_btn", None)
+        if btn is None or not btn.winfo_exists():
+            return
+        if self._perf_on():
+            if not btn.winfo_manager():
+                btn.pack(side="right")
+        else:
+            btn.pack_forget()
+            self._close_perf_popout()
+        self._fit_settings()
+
+    def _toggle_perf_popout(self) -> None:
+        if self._perf_popout is not None:
+            self._close_perf_popout()
+        else:
+            self._open_perf_popout()
+
+    def _open_perf_popout(self) -> None:
+        btn = getattr(self, "_perf_pick_btn", None)
+        if btn is None or not btn.winfo_exists():
+            return
+        pop = tk.Toplevel(self)
+        pop.overrideredirect(True)
+        pop.attributes("-topmost", True)
+        pop.configure(bg=SEPARATOR)
+        self._perf_popout = pop
+        self._perf_popout_body = tk.Frame(pop, bg=BG, padx=8, pady=6)
+        self._perf_popout_body.pack(padx=1, pady=1)
+        self._render_perf_devices()
+        self._after_safe(PERF_POPOUT_POLL_MS, self._perf_popout_tick)
+
+    def _place_perf_popout(self) -> None:
+        """Hang it from the picker button, kept inside the work area."""
+        pop, btn = self._perf_popout, self._perf_pick_btn
+        pop.update_idletasks()
+        w, h = pop.winfo_reqwidth(), pop.winfo_reqheight()
+        x = btn.winfo_rootx() + btn.winfo_width() - w      # right edges line up
+        y = btn.winfo_rooty() + btn.winfo_height()
+        area = work_area_for_rect(x, y, w, h) or (0, 0, pop.winfo_screenwidth(),
+                                                    pop.winfo_screenheight())
+        x, y, w, h = clamp_to_work_area(x, y, w, h, area)
+        pop.geometry(f"+{x}+{y}")
+
+    def _perf_popout_tick(self) -> None:
+        """Close once the mouse is off both the pop-out and its button."""
+        pop, btn = self._perf_popout, getattr(self, "_perf_pick_btn", None)
+        if pop is None or not pop.winfo_exists() or btn is None or not btn.winfo_exists():
+            self._close_perf_popout()
+            return
+        px, py = self.winfo_pointerxy()
+        m = PERF_POPOUT_SLACK
+
+        def over(w: tk.Misc) -> bool:
+            x, y = w.winfo_rootx(), w.winfo_rooty()
+            return x - m <= px < x + w.winfo_width() + m and y - m <= py < y + w.winfo_height() + m
+
+        if not over(pop) and not over(btn):
+            self._close_perf_popout()
+            return
+        self._after_safe(PERF_POPOUT_POLL_MS, self._perf_popout_tick)
+
+    def _close_perf_popout(self) -> None:
+        pop, self._perf_popout = self._perf_popout, None
+        self._perf_popout_body = None
+        if pop is not None:
+            try:
+                pop.destroy()
+            except tk.TclError:
+                pass
+
+    def _render_perf_devices(self) -> None:
+        body = self._perf_popout_body
+        if body is None or not body.winfo_exists():
+            return
+        self._perf_devices_drawn = self._perf.devices_version
+        for child in body.winfo_children():
+            child.destroy()
+        devices = self._perf.snapshot()[0]
+        if not devices:
+            tk.Label(body, text="Finding devices…", bg=BG, fg=FG_DIM,
+                     font=("Segoe UI", 7), bd=0, padx=0, pady=0).pack(anchor="w")
+        for dev in devices:
+            label = dev["title"]
+            if dev["sub"] and dev["kind"] in ("net", "gpu"):
+                label = f"{label}  ·  {dev['sub']}"
+            self._make_checkbox(
+                body, label,
+                get_state=lambda d=dev: self._perf_picked(d),
+                set_state=lambda on, i=dev["id"]: self._set_perf_pick(i, on),
+                swatch=PERF_COLORS[dev["kind"]],
+            )
+        self._place_perf_popout()
 
     def _update_tray_icon(self) -> None:
         self._update_readout()
@@ -2898,6 +3876,16 @@ class UsageWidget(tk.Tk):
                      bg=BG, fg=FG_DIM, font=("Segoe UI", 7),
                      bd=0, padx=0, pady=0).pack(anchor="w", pady=(3, 0))
 
+            self._add_section_header(opts, "Performance graphs")
+            perf_row = self._make_checkbox(
+                opts, "Graphs on taskbar",
+                get_state=self._perf_on,
+                set_state=self._set_perf_on,
+            )
+            self._perf_pick_btn = self._make_dropdown_button(
+                perf_row, "Graphs", self._toggle_perf_popout)
+            self._sync_perf_devices_row()
+
     def _add_section_header(self, parent: tk.Misc, text: str, first: bool = False) -> None:
         if not first:
             tk.Frame(parent, bg=SEPARATOR, height=1).pack(fill="x", pady=(8, 4))
@@ -3011,12 +3999,14 @@ class UsageWidget(tk.Tk):
         return None
 
     def _make_checkbox(self, parent: tk.Misc, label: str,
-                        get_state, set_state, *, indent: int = 0) -> tk.Frame:
+                        get_state, set_state, *, indent: int = 0,
+                        swatch: str | None = None) -> tk.Frame:
         """Settings-row checkbox styled to match the row hide checkboxes.
 
         get_state: () -> bool
         set_state: (new_value: bool) -> str | None   (returns error or None)
         indent: left inset for a child of the row above.
+        swatch: color of a small square before the label.
         """
         row = tk.Frame(parent, bg=BG)
         row.pack(fill="x", pady=(2, 0), padx=(indent, 0))
@@ -3027,6 +4017,9 @@ class UsageWidget(tk.Tk):
                        bg=BG, fg=FG, font=("Segoe UI", 9),
                        cursor="hand2", bd=0, padx=0, pady=0)
         box.pack(side="left", padx=(0, 4))
+
+        if swatch:
+            tk.Frame(row, bg=swatch, width=7, height=7).pack(side="left", padx=(0, 5))
 
         lbl = tk.Label(row, text=label, bg=BG, fg=FG,
                        font=("Segoe UI", 8), cursor="hand2",
@@ -3069,6 +4062,25 @@ class UsageWidget(tk.Tk):
         btn.bind("<Button-1>", lambda _e: cb())
         btn.bind("<Enter>",   lambda _e: btn.config(bg=BTN_BG_HOVER))
         btn.bind("<Leave>",   lambda _e: btn.config(bg=BTN_BG))
+        return btn
+
+    def _make_dropdown_button(self, parent: tk.Misc, text: str, cb) -> tk.Frame:
+        """Gray button with a full-size ▾; the arrow is its own label so it can be bigger."""
+        btn = tk.Frame(parent, bg=BTN_BG, cursor="hand2")
+        tk.Label(btn, text=text, bg=BTN_BG, fg=FG, font=("Segoe UI", 8),
+                 bd=0, padx=0, pady=0).pack(side="left", padx=(8, 3))
+        tk.Label(btn, text="▾", bg=BTN_BG, fg=FG, font=("Segoe UI", 11),
+                 bd=0, padx=0, pady=0).pack(side="left", padx=(0, 6))
+        parts = [btn, *btn.winfo_children()]
+
+        def paint(bg: str) -> None:
+            for p in parts:
+                p.config(bg=bg)
+
+        for p in parts:
+            p.bind("<Button-1>", lambda _e: cb())
+            p.bind("<Enter>", lambda _e: paint(BTN_BG_HOVER))
+            p.bind("<Leave>", lambda _e: paint(BTN_BG))
         return btn
 
     def _make_refresh_button(self, parent: tk.Misc) -> tk.Label:
@@ -3166,6 +4178,7 @@ class UsageWidget(tk.Tk):
         pop.geometry(f"{pw}x{ph}+{x}+{y}")
 
     def _close_settings_window(self) -> None:
+        self._close_perf_popout()
         pop = self._settings_win
         self._settings_win = None
         self._settings_placed = False
