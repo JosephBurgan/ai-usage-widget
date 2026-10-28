@@ -2672,6 +2672,7 @@ class UsageWidget(tk.Tk):
         self._drag_y      = 0
         self._dropped_off: set[str] = set()   # windows the user left hanging off-screen
         self._settings    = load_settings()
+        self._pin_old_tray_defaults()
         self._login_notice = ""
         self._sync_startup_pref()
         self._seed_hidden()
@@ -2803,6 +2804,19 @@ class UsageWidget(tk.Tk):
         try:
             self.iconbitmap(default=str(icon))
         except tk.TclError:
+            pass
+
+    def _pin_old_tray_defaults(self) -> None:
+        """Tray usage used to default on, in the Number style. New installs get
+        off and Ring; an install from before keeps what it showed."""
+        s = self._settings
+        if not s or ("tray_dynamic" in s and "tray_style" in s):
+            return
+        s.setdefault("tray_dynamic", True)
+        s.setdefault("tray_style", "percent")
+        try:
+            save_settings(s)
+        except OSError:
             pass
 
     def _seed_hidden(self) -> None:
@@ -3104,11 +3118,11 @@ class UsageWidget(tk.Tk):
         threading.Thread(target=self._tray.run, daemon=True).start()
 
     def _tray_dynamic(self) -> bool:
-        return bool(self._settings.get("tray_dynamic", True))
+        return bool(self._settings.get("tray_dynamic", False))
 
     def _tray_style(self) -> str:
         style = self._settings.get("tray_style")
-        return style if style in dict(TRAY_STYLES) else "percent"
+        return style if style in dict(TRAY_STYLES) else "ring"
 
     def _tray_meter(self) -> tuple[str, str]:
         raw = self._settings.get("tray_meter")
