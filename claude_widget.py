@@ -38,7 +38,8 @@ CLAUDE_DIR    = Path(os.environ.get("CLAUDE_CONFIG_DIR") or HOME / ".claude")
 CREDS_FILE    = CLAUDE_DIR / ".credentials.json"
 GROK_AUTH     = HOME / ".grok" / "auth.json"
 SETTINGS_FILE = HOME / ".claude_widget_settings.json"
-REPO_DIR      = Path(__file__).resolve().parent
+CRASH_LOG     = HOME / ".claude_widget_crash.log"
+REPO_DIR     = Path(__file__).resolve().parent
 
 
 # ── Atomic JSON I/O ──────────────────────────────────────────────────────────
@@ -1329,7 +1330,11 @@ READOUT_FRAME_MS = 16     # pointer poll while over the readout, dragging or sli
 VK_LBUTTON       = 0x01
 GWLP_HWNDPARENT  = -8
 HWND_TOPMOST     = -1
+GW_HWNDPREV      = 3
+GWL_EXSTYLE      = -20
+WS_EX_TOPMOST    = 0x0008
 SWP_NOACTIVATE   = 0x0010
+SWP_NOZORDER     = 0x0004
 SWP_SHOWWINDOW   = 0x0040
 
 # Keep floating windows off the taskbar. rcWork is the monitor minus the taskbar,
@@ -1707,11 +1712,26 @@ class TaskbarReadout:
                 self._win.deiconify()
         except tk.TclError:
             pass
-        x, y, w, h = self._slot
+        self._place(u32, hwnd)
+        return True
+
+    def _place(self, u32, hwnd: int) -> None:
+        """Pin the spot and sit directly above the taskbar, not at the very top.
+        Jumping to the top fights other topmost overlays (Wispr Flow's tour dims
+        the whole screen); each re-raise flips the readout lit/dim."""
         u32.SetWindowPos.argtypes = (wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int,
                                      ctypes.c_int, ctypes.c_int, wintypes.UINT)
-        u32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE | SWP_SHOWWINDOW)
-        return True
+        u32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+        u32.GetWindow.restype = wintypes.HWND
+        x, y, w, h = self._slot
+        flags = SWP_NOACTIVATE | SWP_SHOWWINDOW
+        u32.GetWindowLongPtrW.restype = ctypes.c_ssize_t
+        if not u32.GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOPMOST:
+            u32.SetWindowPos(hwnd, HWND_TOPMOST, x, y, w, h, flags)
+        above_bar = u32.GetWindow(self._bar, GW_HWNDPREV)
+        if above_bar == hwnd:
+            flags |= SWP_NOZORDER
+        u32.SetWindowPos(hwnd, above_bar or HWND_TOPMOST, x, y, w, h, flags)
 
     def show(self, rows: list[Row], style: str, graphs: list[tuple] = ()) -> None:
         """Perf graphs on the left, then usage. Ring shows rows[0]; bars stack every row.
@@ -1821,6 +1841,7 @@ class TaskbarReadout:
         if self._win is None:
             return
         u32 = ctypes.windll.user32
+        self._keep_above_taskbar(u32)
         pt = wintypes.POINT()
         u32.GetCursorPos(ctypes.byref(pt))
         down = bool(u32.GetAsyncKeyState(VK_LBUTTON) & 0x8000)
@@ -1865,6 +1886,26 @@ class TaskbarReadout:
                 READOUT_FRAME_MS if fast else READOUT_HOVER_MS, self._poll_pointer)
         except tk.TclError:
             pass
+
+    def _keep_above_taskbar(self, u32) -> None:
+        """The taskbar raises itself (clicks, notifications) and its acrylic then
+        dims the readout until the next 500 ms tick. Catch it sooner."""
+        if not self._bar or not self._slot:
+            return
+        try:
+            hwnd = self._hwnd()
+        except tk.TclError:
+            return
+        u32.GetWindow.argtypes = (wintypes.HWND, wintypes.UINT)
+        u32.GetWindow.restype = wintypes.HWND
+        above = hwnd
+        for _ in range(64):
+            above = u32.GetWindow(above, GW_HWNDPREV)
+            if not above:
+                return
+            if above == self._bar:
+                self._place(u32, hwnd)
+                return
 
     def _set_hover(self, key: str | None) -> None:
         if key != self._hover:
@@ -4861,11 +4902,100 @@ class UsageWidget(tk.Tk):
         self._finish_layout()
 
 
+def log_crash(what: str, exc: BaseException | None = None) -> None:
+    import traceback
+    text = "".join(traceback.format_exception(exc)) if exc else ""
+    try:
+        with open(CRASH_LOG, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {what}\n{text}\n")
+    except OSError:
+        pass
+
+
+def install_crash_log() -> None:
+    """pythonw has no console, so a crash vanishes silently. Write why to CRASH_LOG."""
+    import faulthandler
+    try:
+        if CRASH_LOG.exists() and CRASH_LOG.stat().st_size > 256_000:
+            CRASH_LOG.write_text("", encoding="utf-8")
+        # Hard crashes (access violations in Tk or ctypes) skip Python entirely;
+        # faulthandler dumps every thread's stack to this file when one hits.
+        global _fault_file
+        _fault_file = open(CRASH_LOG, "a", encoding="utf-8")
+        faulthandler.enable(_fault_file, all_threads=True)
+    except OSError:
+        pass
+    sys.excepthook = lambda t, e, tb: log_crash("Unhandled error, widget closed", e)
+    threading.excepthook = lambda a: log_crash(f"Unhandled error in thread {a.thread.name}",
+                                               a.exc_value)
+
+
+_EXIT_WATCH = r"""
+$p = Get-Process -Id {pid} -ErrorAction Stop; $null = $p.Handle; $p.WaitForExit()
+$c = $p.ExitCode
+if ($c -eq 0) {{ exit }}
+$hex = '0x{{0:X8}}' -f $c
+$why = switch ($hex) {{
+  '0x00000001' {{ 'killed by taskkill /F or a script (exit 1)' }}
+  '0xFFFFFFFF' {{ 'killed by Stop-Process or Task Manager End task' }}
+  '0xC0000005' {{ 'crashed: access violation (Tk, Pillow or a Windows call)' }}
+  '0xC00000FD' {{ 'crashed: stack overflow' }}
+  '0xC0000409' {{ 'crashed: fast-fail / buffer check inside a native library' }}
+  '0xC000013A' {{ 'stopped by Ctrl+C / Ctrl+Break' }}
+  '0x40010004' {{ 'ended by Windows sign-out or shutdown' }}
+  default {{ 'unknown exit code' }}
+}}
+$all = Get-CimInstance Win32_Process
+$names = @{{}}; $all | ForEach-Object {{ $names[[int]$_.ProcessId] = $_.Name }}
+$since = (Get-Date).AddMinutes(-2)
+$recent = $all | Where-Object {{ $_.CreationDate -gt $since -and $_.ProcessId -ne $PID }} |
+  Sort-Object CreationDate | ForEach-Object {{
+    $l = "$($_.CommandLine)"; if ($l.Length -gt 300) {{ $l = $l.Substring(0, 300) + '...' }}
+    "  $($_.CreationDate.ToString('HH:mm:ss')) $($_.Name) [$($_.ProcessId)] from $($names[[int]$_.ParentProcessId]): $l" }}
+if (-not $recent) {{ $recent = @('  (nothing new started; likely Windows itself, Task Manager, or a long-running app)') }}
+$t = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
+$out = "[$t] Widget (pid {pid}) ended without warning: $why, code $hex`nStarted in the 2 minutes before:`n" + ($recent -join "`n") + "`n`n"
+[IO.File]::AppendAllText('{log}', $out)
+"""
+
+
+def start_exit_watch() -> None:
+    """A kill can't be logged from inside. A hidden PowerShell outlives us, reads the
+    exit code and notes which scripts were running, which usually names the killer.
+    PowerShell, not pythonw, so 'kill every pythonw' doesn't take the watcher too."""
+    if sys.platform != "win32":
+        return
+    script = _EXIT_WATCH.format(pid=os.getpid(), log=str(CRASH_LOG).replace("'", "''"))
+    try:
+        subprocess.Popen(
+            ["powershell", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden",
+             "-EncodedCommand", base64.b64encode(script.encode("utf-16-le")).decode()],
+            creationflags=CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except OSError:
+        pass
+
+
 def main() -> None:
     if not claim_single_instance():
         signal_running_instance()
         return
-    UsageWidget().mainloop()
+    install_crash_log()
+    # A start with no matching end below it means something killed the process outright.
+    log_crash(f"Started (pid {os.getpid()})")
+    start_exit_watch()
+    app = UsageWidget()
+    app.report_callback_exception = lambda t, e, tb: log_crash("Error in a UI callback", e)
+    app.protocol("WM_SAVE_YOURSELF", lambda: log_crash("Windows is signing out or shutting down"))
+    try:
+        app.mainloop()
+    except BaseException as e:
+        log_crash("Main loop died, widget closed", e)
+        raise
+    if getattr(app, "_destroyed", False):
+        log_crash(f"Quit normally (pid {os.getpid()})")
+    else:
+        log_crash("Main loop ended without Quit (window destroyed by something else)")
 
 
 if __name__ == "__main__":

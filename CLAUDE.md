@@ -34,7 +34,7 @@ Order:
 1. Edit `ai-usage-widget\claude_widget.py` (the repo copy).
 2. `python -m py_compile` it. No syntax errors before continuing.
 3. `Copy-Item` repo file → `C:\Users\Joseph\claude_widget.py` (live runtime).
-4. Kill `pythonw*`, relaunch via `wscript` on the `.vbs`.
+4. Kill only the widget's `pythonw` (command line matches `claude_widget`), never all `pythonw*` — other tools run on pythonw too. Relaunch via `wscript` on the `.vbs`.
 5. Ask Joseph to verify visually. Screenshots are how he reviews.
 6. Only after OK: `git add` (specific files, not `-A`), commit, tag, push.
 
@@ -50,7 +50,7 @@ Order:
 - Joseph reads code and screenshots, not diffs. Explain changes in 3-5 plain-English bullets.
 - Minimal blue. Buttons gray (`BTN_BG`/`BTN_BG_HOVER`), white text. No accent colors except the green/orange/red usage bars.
 - All UI mutations via `_after_safe()` so destroyed-window callbacks no-op.
-- No log files. Nothing on disk beyond `~/.claude_widget_settings.json`.
+- No log files except `~/.claude_widget_crash.log` (start/quit lines, crashes, and why the process ended). Nothing else on disk beyond `~/.claude_widget_settings.json`.
 
 ## Sync target
 
