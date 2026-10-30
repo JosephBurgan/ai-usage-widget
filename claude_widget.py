@@ -1186,7 +1186,8 @@ BTN_BG_HOVER = "#3a3a3a"
 TIME_BAR_BG  = "#262626"   # slightly darker than BAR_BG
 TIME_BAR_FG  = "#999999"   # quiet light gray; day notches use this too
 BAR_TICK_FG  = "#c8c8c8"   # tick on top of the split bar being filled
-READOUT_TRACK = "#535353"  # bars readout track, lighter than BAR_BG
+READOUT_TRACK = "#535353"  # bars readout track stroke, lighter than BAR_BG
+READOUT_TRACK_FILL = "#323232"  # inside the stroke, a step darker
 READOUT_TIME_FG = "#cfcdc8"  # bars readout reset fill, a lighter take on the taskbar's running-app line
 BAR_H        = 6
 STACK_H      = 8            # Grok weekly bar, tall enough to read category colors
@@ -1626,7 +1627,7 @@ def render_readout_bars(rows: list[Row], w: int, h: int, bg: str):
                          time_gap=READOUT_BARS_GAP, bar_tick=READOUT_BAR_TICK,
                          time_tick=READOUT_TIME_TICK, track=READOUT_TRACK,
                          time_fg=READOUT_TIME_FG, rounded=False,
-                         track_fill=bg)   # see-through, like the perf tiles
+                         track_fill=READOUT_TRACK_FILL)
         y += sh + READOUT_STACK_GAP
     return img.resize((w, h), Image.LANCZOS)
 
