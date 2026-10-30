@@ -1186,8 +1186,10 @@ BTN_BG_HOVER = "#3a3a3a"
 TIME_BAR_BG  = "#262626"   # slightly darker than BAR_BG
 TIME_BAR_FG  = "#999999"   # quiet light gray; day notches use this too
 BAR_TICK_FG  = "#c8c8c8"   # tick on top of the split bar being filled
-READOUT_TRACK = "#535353"  # bars readout track stroke, lighter than BAR_BG
-READOUT_TRACK_FILL = "#323232"  # inside the stroke, a step darker
+READOUT_TRACK = "#535353"  # bars readout track tips, lighter than BAR_BG
+READOUT_TRACK_FILL = "#323232"  # rest of the empty track, a step darker
+READOUT_TRACK_TIP = 1      # px of READOUT_TRACK on top of each vertical bar
+READOUT_TIME_TIP  = 2      # px of READOUT_TRACK at the right end of each reset bar
 READOUT_TIME_FG = "#cfcdc8"  # bars readout reset fill, a lighter take on the taskbar's running-app line
 BAR_H        = 6
 STACK_H      = 8            # Grok weekly bar, tall enough to read category colors
@@ -1627,7 +1629,8 @@ def render_readout_bars(rows: list[Row], w: int, h: int, bg: str):
                          time_gap=READOUT_BARS_GAP, bar_tick=READOUT_BAR_TICK,
                          time_tick=READOUT_TIME_TICK, track=READOUT_TRACK,
                          time_fg=READOUT_TIME_FG, rounded=False,
-                         track_fill=READOUT_TRACK_FILL)
+                         track_fill=READOUT_TRACK_FILL, track_tip=READOUT_TRACK_TIP,
+                         time_track_tip=READOUT_TIME_TIP)
         y += sh + READOUT_STACK_GAP
     return img.resize((w, h), Image.LANCZOS)
 
@@ -2013,7 +2016,8 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
                      time_h: int | None = None, time_gap: int = 0,
                      bar_tick: int = 0, time_tick: int = 0, track: str = BAR_BG,
                      time_fg: str = TIME_BAR_FG, rounded: bool = True,
-                     track_fill: str | None = None) -> None:
+                     track_fill: str | None = None, track_tip: int = 0,
+                     time_track_tip: int | None = None) -> None:
     """Split bars in a w×h px box at (x, y) on a TRAY_SS-supersampled canvas.
 
     Fills left to right; the bar in progress fills bottom-up. Edges sit on whole
@@ -2021,6 +2025,10 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
     the reset bar. Ticks mark each bar's full end, so the gap to them shows
     what's left: bar_tick px of light gray on top of the bar being filled,
     time_tick px of white at the reset bar's far end.
+
+    With track_fill, empty track is that color with a band of the track color
+    at each bar's full end, under the fills: track_tip px on top of the bars,
+    time_track_tip px (default track_tip) at the right of the reset bar.
     """
     s = TRAY_SS
     util = min(max(util, 0.0), 1.0)
@@ -2030,9 +2038,9 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
     bw, gw = _split_bars_grid(w, segments, gap)
     x += (w - gw) // 2
     r = int(bw * s * 0.25) if rounded else 0
-    # Solid track, or a 1px inside stroke of the track color around track_fill.
-    track_ink = ({"fill": track} if track_fill is None
-                 else {"fill": track_fill, "outline": track, "width": s})
+    track_ink = {"fill": track if track_fill is None else track_fill}
+    tip = track_tip if track_fill is not None else 0
+    time_tip = (track_tip if time_track_tip is None else time_track_tip) if track_fill else 0
     bars_h = h
     sits = time_progress is not None and time_gap == 0
     if time_progress is not None:
@@ -2043,6 +2051,8 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
         tr = max(0, min(r, (th * s - 3) // 2))
         d.rounded_rectangle((x * s, ty, (x + gw) * s - 1, bottom), radius=tr,
                             corners=(not sits, not sits, True, True), **track_ink)
+        if time_tip:
+            d.rectangle(((x + gw - time_tip) * s, ty, (x + gw) * s - 1, bottom), fill=track)
         tp = min(max(time_progress, 0.0), 1.0)
         end = round(gw * tp)
         if end > 0:
@@ -2062,6 +2072,8 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
         x0 = (x + i * (bw + gap)) * s
         x1 = x0 + bw * s - 1
         d.rounded_rectangle((x0, top, x1, bottom), radius=r, corners=corners, **track_ink)
+        if tip:
+            d.rectangle((x0, top, x1, top + tip * s - 1), fill=track)
         part = min(max(filled - i, 0.0), 1.0)
         fill_h = round(bars_h * part)
         if fill_h > 0:
