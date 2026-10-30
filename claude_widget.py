@@ -1185,6 +1185,9 @@ BTN_BG       = "#2a2a2a"
 BTN_BG_HOVER = "#3a3a3a"
 TIME_BAR_BG  = "#262626"   # slightly darker than BAR_BG
 TIME_BAR_FG  = "#999999"   # quiet light gray; day notches use this too
+BAR_TICK_FG  = "#c8c8c8"   # tick on top of the split bar being filled
+READOUT_TRACK = "#535353"  # bars readout track, lighter than BAR_BG
+READOUT_TIME_FG = "#cfcdc8"  # bars readout reset fill, a lighter take on the taskbar's running-app line
 BAR_H        = 6
 STACK_H      = 8            # Grok weekly bar, tall enough to read category colors
 TIME_BAR_H   = 2            # slim accent under the usage bar
@@ -1525,8 +1528,8 @@ READOUT_STYLES   = (("ring", "Ring"), ("bars", "Bars"))
 READOUT_BARS_PAD    = 4     # px margin on every side of the bars readout
 READOUT_BARS_SPACE  = 2     # px between neighbouring vertical bars
 READOUT_BARS_GAP    = 1     # px between the vertical bars and their reset bar
-READOUT_BAR_TICK    = 1     # px tick on top of every vertical bar
-READOUT_TIME_TICK   = 2     # px tick at the far end of each reset bar
+READOUT_BAR_TICK    = 0     # px tick on top of the bar being filled; 0 = off
+READOUT_TIME_TICK   = 0     # px tick at the far end of each reset bar; 0 = off
 READOUT_STACK_GAP   = 3     # px between the 5-hour and 7-day stacks
 READOUT_STACK_TIME_H = 2    # px, reset bar height when stacked
 READOUT_STACK       = ("5-hour", "7-day")
@@ -1621,7 +1624,9 @@ def render_readout_bars(rows: list[Row], w: int, h: int, bg: str):
                          gap=READOUT_BARS_SPACE,
                          time_h=READOUT_STACK_TIME_H if stacked else None,
                          time_gap=READOUT_BARS_GAP, bar_tick=READOUT_BAR_TICK,
-                         time_tick=READOUT_TIME_TICK)
+                         time_tick=READOUT_TIME_TICK, track=READOUT_TRACK,
+                         time_fg=READOUT_TIME_FG, rounded=False,
+                         track_fill=bg)   # see-through, like the perf tiles
         y += sh + READOUT_STACK_GAP
     return img.resize((w, h), Image.LANCZOS)
 
@@ -2005,13 +2010,15 @@ def _tint(hex_color: str, amount: float) -> str:
 def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: int,
                      time_progress: float | None, gap: int | None = None,
                      time_h: int | None = None, time_gap: int = 0,
-                     bar_tick: int = 0, time_tick: int = 0) -> None:
+                     bar_tick: int = 0, time_tick: int = 0, track: str = BAR_BG,
+                     time_fg: str = TIME_BAR_FG, rounded: bool = True,
+                     track_fill: str | None = None) -> None:
     """Split bars in a w×h px box at (x, y) on a TRAY_SS-supersampled canvas.
 
     Fills left to right; the bar in progress fills bottom-up. Edges sit on whole
     output pixels so small sizes stay crisp. time_gap is px between the bars and
     the reset bar. Ticks mark each bar's full end, so the gap to them shows
-    what's left: bar_tick px of light usage tint on top of every usage bar,
+    what's left: bar_tick px of light gray on top of the bar being filled,
     time_tick px of white at the reset bar's far end.
     """
     s = TRAY_SS
@@ -2021,7 +2028,10 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
         gap = max(1, round(h * TRAY_BAR_GAP))
     bw, gw = _split_bars_grid(w, segments, gap)
     x += (w - gw) // 2
-    r = int(bw * s * 0.25)
+    r = int(bw * s * 0.25) if rounded else 0
+    # Solid track, or a 1px inside stroke of the track color around track_fill.
+    track_ink = ({"fill": track} if track_fill is None
+                 else {"fill": track_fill, "outline": track, "width": s})
     bars_h = h
     sits = time_progress is not None and time_gap == 0
     if time_progress is not None:
@@ -2030,13 +2040,13 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
         ty, bottom = (y + h - th) * s, (y + h) * s - 1
         # Pillow needs radius <= (span - 3) / 2 when two corners share a side.
         tr = max(0, min(r, (th * s - 3) // 2))
-        d.rounded_rectangle((x * s, ty, (x + gw) * s - 1, bottom), radius=tr, fill=BAR_BG,
-                            corners=(not sits, not sits, True, True))
+        d.rounded_rectangle((x * s, ty, (x + gw) * s - 1, bottom), radius=tr,
+                            corners=(not sits, not sits, True, True), **track_ink)
         tp = min(max(time_progress, 0.0), 1.0)
         end = round(gw * tp)
         if end > 0:
             d.rounded_rectangle((x * s, ty, (x + end) * s - 1, bottom),
-                                radius=max(0, min(tr, (end * s - 3) // 2)), fill=TIME_BAR_FG,
+                                radius=max(0, min(tr, (end * s - 3) // 2)), fill=time_fg,
                                 corners=(not sits, not sits and tp >= 1, tp >= 1, True))
         if time_tick:
             mx = x + gw - time_tick
@@ -2046,18 +2056,19 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
     # Square bottoms when the bars sit on the reset bar.
     corners = (True, True, not sits, not sits)
     filled = util * segments
+    active = min(int(filled), segments - 1)
     for i in range(segments):
         x0 = (x + i * (bw + gap)) * s
         x1 = x0 + bw * s - 1
-        d.rounded_rectangle((x0, top, x1, bottom), radius=r, fill=BAR_BG, corners=corners)
+        d.rounded_rectangle((x0, top, x1, bottom), radius=r, corners=corners, **track_ink)
         part = min(max(filled - i, 0.0), 1.0)
         fill_h = round(bars_h * part)
         if fill_h > 0:
             y0 = (y + bars_h - fill_h) * s
             d.rounded_rectangle((x0, y0, x1, bottom), radius=max(0, min(r, (bottom - y0 - 2) // 2)),
                                 fill=color, corners=corners)
-        if bar_tick:
-            d.rectangle((x0, top, x1, top + bar_tick * s - 1), fill=_tint(color, 0.55))
+        if bar_tick and i == active:
+            d.rectangle((x0, top, x1, top + bar_tick * s - 1), fill=BAR_TICK_FG)
 
 
 def render_tray_icon(util: float, style: str, segments: int = 5,
@@ -3047,6 +3058,7 @@ class UsageWidget(tk.Tk):
         menu = tk.Menu(self, tearoff=0, bg=BG, fg=FG, activebackground=BTN_BG_HOVER,
                        activeforeground=FG, bd=0)
         menu.add_command(label="Reset position", command=self._reset_position)
+        menu.add_command(label="Refresh", command=self._manual_refresh)
         try:
             menu.tk_popup(x, y)
         finally:
