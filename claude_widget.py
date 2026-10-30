@@ -1525,7 +1525,8 @@ READOUT_STYLES   = (("ring", "Ring"), ("bars", "Bars"))
 READOUT_BARS_PAD    = 4     # px margin on every side of the bars readout
 READOUT_BARS_SPACE  = 2     # px between neighbouring vertical bars
 READOUT_BARS_GAP    = 1     # px between the vertical bars and their reset bar
-READOUT_MARKER_W    = 1     # px line where each fill ends
+READOUT_BAR_TICK    = 1     # px tick on top of every vertical bar
+READOUT_TIME_TICK   = 2     # px tick at the far end of each reset bar
 READOUT_STACK_GAP   = 3     # px between the 5-hour and 7-day stacks
 READOUT_STACK_TIME_H = 2    # px, reset bar height when stacked
 READOUT_STACK       = ("5-hour", "7-day")
@@ -1619,7 +1620,8 @@ def render_readout_bars(rows: list[Row], w: int, h: int, bg: str):
         _draw_split_bars(d, pad, y, w - 2 * pad, sh, row[1], tray_segments(row), row[3],
                          gap=READOUT_BARS_SPACE,
                          time_h=READOUT_STACK_TIME_H if stacked else None,
-                         time_gap=READOUT_BARS_GAP, marker=READOUT_MARKER_W)
+                         time_gap=READOUT_BARS_GAP, bar_tick=READOUT_BAR_TICK,
+                         time_tick=READOUT_TIME_TICK)
         y += sh + READOUT_STACK_GAP
     return img.resize((w, h), Image.LANCZOS)
 
@@ -2002,13 +2004,15 @@ def _tint(hex_color: str, amount: float) -> str:
 
 def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: int,
                      time_progress: float | None, gap: int | None = None,
-                     time_h: int | None = None, time_gap: int = 0, marker: int = 0) -> None:
+                     time_h: int | None = None, time_gap: int = 0,
+                     bar_tick: int = 0, time_tick: int = 0) -> None:
     """Split bars in a w×h px box at (x, y) on a TRAY_SS-supersampled canvas.
 
     Fills left to right; the bar in progress fills bottom-up. Edges sit on whole
     output pixels so small sizes stay crisp. time_gap is px between the bars and
-    the reset bar. marker is the px thickness of a line where each fill ends:
-    white on the reset bar, a light tint of the usage color on the bars.
+    the reset bar. Ticks mark each bar's full end, so the gap to them shows
+    what's left: bar_tick px of light usage tint on top of every usage bar,
+    time_tick px of white at the reset bar's far end.
     """
     s = TRAY_SS
     util = min(max(util, 0.0), 1.0)
@@ -2034,9 +2038,9 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
             d.rounded_rectangle((x * s, ty, (x + end) * s - 1, bottom),
                                 radius=max(0, min(tr, (end * s - 3) // 2)), fill=TIME_BAR_FG,
                                 corners=(not sits, not sits and tp >= 1, tp >= 1, True))
-        if marker:
-            mx = x + min(max(end - marker, 0), gw - marker)
-            d.rectangle((mx * s, ty, (mx + marker) * s - 1, bottom), fill="#ffffff")
+        if time_tick:
+            mx = x + gw - time_tick
+            d.rectangle((mx * s, ty, (mx + time_tick) * s - 1, bottom), fill="#ffffff")
         bars_h = h - th - time_gap
     top, bottom = y * s, (y + bars_h) * s - 1
     # Square bottoms when the bars sit on the reset bar.
@@ -2052,8 +2056,8 @@ def _draw_split_bars(d, x: int, y: int, w: int, h: int, util: float, segments: i
             y0 = (y + bars_h - fill_h) * s
             d.rounded_rectangle((x0, y0, x1, bottom), radius=max(0, min(r, (bottom - y0 - 2) // 2)),
                                 fill=color, corners=corners)
-            if marker and part < 1:
-                d.rectangle((x0, y0, x1, y0 + marker * s - 1), fill=_tint(color, 0.55))
+        if bar_tick:
+            d.rectangle((x0, top, x1, top + bar_tick * s - 1), fill=_tint(color, 0.55))
 
 
 def render_tray_icon(util: float, style: str, segments: int = 5,
